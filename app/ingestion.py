@@ -5,6 +5,7 @@ os.environ["USER_AGENT"] = "langchain-ingestion/1.0"
 from typing import List
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import Docx2txtLoader
 
 # Windows: inject Poppler into PATH for this process (pdf2image dependency)
 # if os.name == "nt":
@@ -69,21 +70,21 @@ def load_csv(file_path: str) -> List[Document]:
 # ============================================================
 # LOADER 4: DOCX FILES
 # ============================================================
-def load_docx_files(directory: str) -> List[Document]:
-    from langchain_community.document_loaders import UnstructuredWordDocumentLoader
-
-    all_docs = []
-    for filename in os.listdir(directory):
-        if not filename.endswith(".docx"):
-            continue
-        file_path = os.path.join(directory, filename)
-        loader = UnstructuredWordDocumentLoader(file_path, mode="elements")
-        docs = loader.load()
-        for doc in docs:
-            doc.metadata["source_type"] = "docx"
-            doc.metadata["file_name"] = filename
-        all_docs.extend(docs)
-    return all_docs
+def load_docx_files(directory: str):
+    documents = []
+    
+    for file in os.listdir(directory):
+        if file.endswith(".docx"):
+            file_path = os.path.join(directory, file)
+            try:
+                loader = Docx2txtLoader(file_path)
+                docs = loader.load()
+                print(f"[DOCX] Loaded using Docx2txt: {file_path}")
+                documents.extend(docs)
+            except Exception as e:
+                print(f"[DOCX] Failed to load {file_path}: {e}")
+    
+    return documents
 
 
 # ============================================================

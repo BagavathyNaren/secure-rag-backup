@@ -4,6 +4,7 @@ import os
 os.environ["USER_AGENT"] = "langchain-ingestion/1.0"
 from typing import List
 from langchain_core.documents import Document
+from langchain_community.document_loaders import PyPDFLoader
 
 # Windows: inject Poppler into PATH for this process (pdf2image dependency)
 # if os.name == "nt":
@@ -37,34 +38,17 @@ def load_text_files(directory: str) -> List[Document]:
 # ============================================================
 # LOADER 2: PDF FILES (Smart — handles text + scanned)
 # ============================================================
-def load_pdf(file_path: str) -> List[Document]:
-    from langchain_community.document_loaders import PyPDFLoader, UnstructuredPDFLoader
 
-    filename = os.path.basename(file_path)
 
-    # Attempt 1: Fast text-based extraction
-    loader = PyPDFLoader(file_path)
-    docs = loader.load()
-
-    total_chars = sum(len(doc.page_content) for doc in docs)
-
-    if total_chars > 50:
-        print(f"[PDF] Text-based extraction: {file_path}")
-        for doc in docs:
-            doc.metadata["source_type"] = "pdf"
-            doc.metadata["file_name"] = filename
-            doc.metadata["pdf_method"] = "text_extraction"
+def load_pdf(file_path: str):
+    try:
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
+        print(f"[PDF] Loaded using PyPDF: {file_path}")
         return docs
-
-    # Attempt 2: Full OCR via UnstructuredPDFLoader (production-grade)
-    print(f"[PDF] Text extraction failed, falling back to OCR: {file_path}")
-    loader = UnstructuredPDFLoader(file_path, mode="elements")
-    docs = loader.load()
-    for doc in docs:
-        doc.metadata["source_type"] = "pdf"
-        doc.metadata["file_name"] = filename
-        doc.metadata["pdf_method"] = "ocr"
-    return docs
+    except Exception as e:
+        print(f"[PDF] Failed to load {file_path}: {e}")
+        return []
 
 
 # ============================================================

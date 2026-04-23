@@ -55,42 +55,21 @@ def redact_pii(text: str) -> str:
 # ============================================================
 # 2️⃣ BUILD BASE VECTORSTORE (ONCE - PERSISTENT)
 # ============================================================
+# ============================================================
+# 2️⃣ LOAD PREBUILT FAISS INDEX (FROM REPO)
+# ============================================================
 
-INDEX_PATH = "/data/faiss_index"
-
-# DEBUG - remove after fix
-print(f"📂 INDEX_PATH = {INDEX_PATH}")
-print(f"📂 /data exists: {os.path.exists('/data')}")
-print(f"📂 Index exists: {os.path.exists(INDEX_PATH)}")
-try:
-    print(f"📂 /data contents: {os.listdir('/data')}")
-except Exception as e:
-    print(f"📂 Cannot list /data: {e}")
-
+INDEX_PATH = "faiss_index"
 
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-if os.path.exists(INDEX_PATH):
-    print("✅ Loading existing FAISS index...")
-    _vectorstore = FAISS.load_local(
-        INDEX_PATH,
-        _embeddings,
-        allow_dangerous_deserialization=True
-    )
-    print("✅ FAISS index loaded.")
-else:
-    print("🔐 Building new FAISS index...")
-    _documents = ingest_all()
-    _chunks = recursive_character_chunking(
-        _documents,
-        chunk_size=600,
-        chunk_overlap=150
-    )
-    _vectorstore = FAISS.from_documents(_chunks, _embeddings)
-
-    os.makedirs("/data", exist_ok=True)
-    _vectorstore.save_local(INDEX_PATH)
-    print("✅ FAISS index built and saved to persistent storage.")
+print("✅ Loading prebuilt FAISS index from repo...")
+_vectorstore = FAISS.load_local(
+    INDEX_PATH,
+    _embeddings,
+    allow_dangerous_deserialization=True
+)
+print("✅ FAISS index loaded.")
 
 # ============================================================
 # 3️⃣ ROLE-BASED RETRIEVAL

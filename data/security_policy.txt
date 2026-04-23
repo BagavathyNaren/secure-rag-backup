@@ -1,0 +1,33 @@
+Information Security Policy - TechCorp Inc.
+
+Effective Date: January 1, 2025
+
+Section 1: Data Classification
+All company data is classified into three tiers: Public, Internal, and Confidential.
+Confidential data includes customer PII, financial records, and trade secrets.
+Internal data includes project documentation, internal communications, and org charts.
+
+Section 2: Access Control
+Access to Confidential data requires manager approval and completion of security
+training. Role-based access control (RBAC) is enforced across all systems.
+Access reviews are conducted quarterly by the Security team.
+
+Section 3: Incident Response
+All security incidents must be reported to security@techcorp.com within 1 hour
+of discovery. The incident response team will triage within 4 hours.
+Critical incidents trigger automatic notification to the CTO and legal counsel.
+A post-mortem report is required within 5 business days of resolution.
+
+Section 4: Password Policy
+Passwords must be minimum 14 characters with uppercase, lowercase, numbers, and
+special characters. Password rotation is required every 90 days.
+Password reuse of the last 12 passwords is prohibited.
+Multi-factor authentication is mandatory for all systems.
+
+Section 5: Vendor Security
+All third-party vendors must complete a security questionnaire before onboarding.
+Vendors handling Confidential data must provide SOC 2 Type II certification.
+Annual vendor security reviews are mandatory.
+
+Section 6: Network Security
+Use of public Wi-Fi is prohibited without VPN. All remote connections must use the company-approved VPN.

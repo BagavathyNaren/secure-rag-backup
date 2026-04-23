@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.env
+.git
+*.egg-info
+Lib/
+Scripts/
+Include/
+share/
+etc/
+pkgs/
+python.exe
+*.dll

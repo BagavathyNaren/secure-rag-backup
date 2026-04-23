@@ -1,0 +1,11 @@
+quarter,region,product,revenue,units_sold,sales_rep
+Q1-2025,North America,Laptop Pro 15,2599800,2000,Sarah Chen
+Q1-2025,Europe,Laptop Pro 15,1949850,1500,Marcus Weber
+Q1-2025,Asia Pacific,Laptop Pro 15,1299900,1000,Yuki Tanaka
+Q1-2025,North America,Wireless Mouse,249950,5000,Sarah Chen
+Q1-2025,Europe,Wireless Mouse,174965,3500,Marcus Weber
+Q2-2025,North America,Laptop Pro 15,3249750,2500,Sarah Chen
+Q2-2025,North America,USB-C Hub,399950,5000,James Wilson
+Q2-2025,Europe,USB-C Hub,319960,4000,Marcus Weber
+Q2-2025,Asia Pacific,Wireless Mouse,99980,2000,Yuki Tanaka
+Q2-2025,North America,Monitor Ultra 27,1874625,1500,James Wilson

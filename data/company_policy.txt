@@ -1,0 +1,33 @@
+Remote Work Policy - TechCorp Inc.
+
+Effective Date: January 1, 2025
+
+Section 1: Eligibility
+All full-time employees who have completed their 90-day probation period are eligible for remote work. Engineers must complete 6 months of employment before joining on-call rotation. Contract workers and interns must receive written approval from their department head.
+
+Section 2: Work Hours
+Remote employees must be available during core hours of 10:00 AM to 3:00 PM Eastern Time. Flexible scheduling is permitted outside core hours with manager approval. Total weekly hours must not fall below 40 hours.
+
+Section 3: Equipment
+The company provides a laptop and one external monitor. Employees are responsible for maintaining a stable internet connection with minimum 50 Mbps download speed. A $500 annual equipment allowance is provided for home office setup.
+
+Section 4: Security
+All work must be conducted on company-issued devices. Use of public Wi-Fi is prohibited without VPN. Employees must enable full-disk encryption and two-factor authentication on all accounts.
+
+Section 5: Communication
+Daily standups are mandatory via Microsoft Teams at 10:00 AM ET. Camera must be on during all client-facing meetings. Response time to messages during core hours should not exceed 30 minutes.
+
+Section 6: Performance
+Remote employees are evaluated on output and deliverables, not hours logged. Quarterly reviews will assess productivity, collaboration, and adherence to this policy. Two consecutive unsatisfactory reviews may result in revocation of remote work privileges.
+
+Section 7: Expenses
+Internet reimbursement up to $75/month is available upon submission of receipts. Co-working space memberships up to $200/month are reimbursable with prior approval. Travel to the main office in Austin, Texas for quarterly meetings is fully covered.
+
+Security Policy:
+- Minimum password length is 14 characters.
+
+Travel Policy:
+- Hotel reimbursement is capped at $350 per night in high-cost cities.
+
+Engineering Policy:
+- All pull requests must be reviewed by at least two engineers before merging.

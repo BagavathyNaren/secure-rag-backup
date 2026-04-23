@@ -58,6 +58,16 @@ def redact_pii(text: str) -> str:
 
 INDEX_PATH = "/data/faiss_index"
 
+# DEBUG - remove after fix
+print(f"📂 INDEX_PATH = {INDEX_PATH}")
+print(f"📂 /data exists: {os.path.exists('/data')}")
+print(f"📂 Index exists: {os.path.exists(INDEX_PATH)}")
+try:
+    print(f"📂 /data contents: {os.listdir('/data')}")
+except Exception as e:
+    print(f"📂 Cannot list /data: {e}")
+
+
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 if os.path.exists(INDEX_PATH):

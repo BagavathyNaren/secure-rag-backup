@@ -53,16 +53,15 @@ def redact_pii(text: str) -> str:
 
 
 # ============================================================
-# 2️⃣ BUILD BASE VECTORSTORE (ONCE)
+# 2️⃣ BUILD BASE VECTORSTORE (ONCE - PERSISTENT)
 # ============================================================
 
-
-INDEX_PATH = "data/indexed/faiss_index"
+INDEX_PATH = "/data/faiss_index"
 
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 if os.path.exists(INDEX_PATH):
-    print("🔐 Loading existing FAISS index...")
+    print("✅ Loading existing FAISS index...")
     _vectorstore = FAISS.load_local(
         INDEX_PATH,
         _embeddings,
@@ -79,9 +78,9 @@ else:
     )
     _vectorstore = FAISS.from_documents(_chunks, _embeddings)
 
-    os.makedirs("data/indexed", exist_ok=True)
+    os.makedirs("/data", exist_ok=True)
     _vectorstore.save_local(INDEX_PATH)
-    print("✅ FAISS index built and saved.")
+    print("✅ FAISS index built and saved to persistent storage.")
 
 # ============================================================
 # 3️⃣ ROLE-BASED RETRIEVAL

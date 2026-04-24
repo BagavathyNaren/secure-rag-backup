@@ -83,19 +83,18 @@ def build_secure_retriever(user_role: str):
         "admin": None,
     }
 
-    if user_role == "admin":
-        return _vectorstore.as_retriever(search_kwargs={"k": 3})
-
     allowed = allowed_sources.get(user_role, [])
+    base_retriever = _vectorstore.as_retriever(search_kwargs={"k": 3})
 
-    retriever = _vectorstore.as_retriever(search_kwargs={"k": 3})
+    if user_role == "admin":
+        # Admin sees everything
+        def retrieve(query: str):
+            return base_retriever.invoke(query)
+        return retrieve
 
     def filtered_retrieval(query: str):
-        docs = retriever.invoke(query)
-        return [
-            d for d in docs
-            if d.metadata.get("file_name") in allowed
-        ]
+        docs = base_retriever.invoke(query)
+        return [d for d in docs if d.metadata.get("file_name") in allowed]
 
     return filtered_retrieval
 

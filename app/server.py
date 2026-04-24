@@ -72,7 +72,7 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
 
         # ---- Secure Retrieval ----
         retriever = build_secure_retriever(body.role)
-        retrieved_docs = retriever.invoke(user_input)
+        retrieved_docs = retriever(user_input)
         context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
         # ---- Streaming Chain ----

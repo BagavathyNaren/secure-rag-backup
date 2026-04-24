@@ -88,12 +88,16 @@ def build_secure_retriever(user_role: str):
 
     allowed = allowed_sources.get(user_role, [])
 
-    return _vectorstore.as_retriever(
-        search_kwargs={
-            "k": 3,
-            "filter": {"file_name": {"$in": allowed}}
-        }
-    )
+    retriever = _vectorstore.as_retriever(search_kwargs={"k": 3})
+
+    def filtered_retrieval(query: str):
+        docs = retriever.invoke(query)
+        return [
+            d for d in docs
+            if d.metadata.get("file_name") in allowed
+        ]
+
+    return filtered_retrieval
 
 
 # ============================================================

@@ -70,9 +70,13 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
         detect_prompt_injection(body.question)
         user_input = redact_pii(body.question)
 
+
         # ---- Secure Retrieval ----
+        print(f"DEBUG: user_role = {body.role}")
         retriever = build_secure_retriever(body.role)
+        print(f"DEBUG: retriever type = {type(retriever)}")
         retrieved_docs = retriever(user_input)
+        print(f"DEBUG: retrieved_docs count = {len(retrieved_docs)}")
         context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
         # ---- Streaming Chain ----

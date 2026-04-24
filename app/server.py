@@ -12,7 +12,7 @@ from typing import AsyncGenerator
 import json
 import traceback
 import logging
-
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from app.secure_rag import (
     detect_prompt_injection,
     redact_pii,

@@ -10,7 +10,18 @@ from slowapi.extension import _rate_limit_exceeded_handler
 from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator
 import json
-from app.secure_rag import secure_rag_invoke
+
+from app.secure_rag import (
+    detect_prompt_injection,
+    redact_pii,
+    build_secure_retriever,
+    secure_prompt,
+    _llm,
+    model_guard_check,
+    enforce_one_sentence,
+    compute_confidence,
+    log_event,
+)
 
 # ============================================================
 # 1️⃣ FASTAPI INIT

@@ -7,7 +7,9 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.extension import _rate_limit_exceeded_handler
-
+from fastapi.responses import StreamingResponse
+from typing import AsyncGenerator
+import json
 from app.secure_rag import secure_rag_invoke
 
 # ============================================================
@@ -45,22 +47,66 @@ class SecureRAGResponse(BaseModel):
 
 
 # ============================================================
-# 4️⃣ SECURE RAG ENDPOINT
+# 4️⃣ SECURE RAG ENDPOINT (STREAMING)
 # ============================================================
 
-@app.post("/secure-rag/invoke", response_model=SecureRAGResponse)
+@app.post("/secure-rag/invoke")
 @limiter.limit("10/minute")
 async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
 
     try:
-        result = secure_rag_invoke(
-            user_input=body.question,
-            user_role=body.role
+        # ---- Input Guardrails ----
+        detect_prompt_injection(body.question)
+        user_input = redact_pii(body.question)
+
+        # ---- Secure Retrieval ----
+        retriever = build_secure_retriever(body.role)
+        retrieved_docs = retriever.invoke(user_input)
+        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+
+        # ---- Streaming Chain ----
+        setup = RunnableParallel(
+            context=lambda _: context,
+            question=RunnablePassthrough()
         )
 
-        return SecureRAGResponse(
-            answer=result["answer"],
-            confidence=result["confidence"]
+        rag_chain = setup | secure_prompt | _llm | StrOutputParser()
+
+        async def stream_tokens() -> AsyncGenerator[str, None]:
+            """
+            Yield tokens as they arrive from the LLM.
+            Also run final guardrails after completion.
+            """
+            full_answer = ""
+
+            # Stream each token
+            async for chunk in rag_chain.astream(user_input):
+                full_answer += chunk
+                yield f"data: {json.dumps({'token': chunk})}\n\n"
+
+            # ---- Output Guardrails (post-stream) ----
+            try:
+                full_answer = model_guard_check(full_answer)
+                full_answer = enforce_one_sentence(full_answer)
+                confidence = compute_confidence(retrieved_docs, full_answer)
+
+                log_event("ANSWER", full_answer)
+
+                # Final message with metadata
+                yield f"""data: {json.dumps({
+                         'done': True,
+                        'answer': full_answer,
+                        'confidence': confidence
+                    })}\n\n"""
+
+            except ValueError as ve:
+                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': 'Internal guardrail error'})}\n\n"
+
+        return StreamingResponse(
+            stream_tokens(),
+            media_type="text/event-stream"
         )
 
     except ValueError as ve:

@@ -118,7 +118,11 @@ Question:
 Answer:
 """)
 
-_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+_llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    streaming=True
+)
 
 
 # ============================================================

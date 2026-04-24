@@ -172,7 +172,7 @@ async def health_check():
     if all(v == "healthy" for v in health_status["components"].values()):
         health_status["status"] = "healthy"
 
-    return JSONResponse(content=health_status)
+    return health_status
 
 # ============================================================
 # RUN (local dev)

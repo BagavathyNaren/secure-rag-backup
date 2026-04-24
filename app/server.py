@@ -10,6 +10,8 @@ from slowapi.extension import _rate_limit_exceeded_handler
 from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator
 import json
+import traceback
+import logging
 
 from app.secure_rag import (
     detect_prompt_injection,
@@ -22,6 +24,8 @@ from app.secure_rag import (
     compute_confidence,
     log_event,
 )
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # 1️⃣ FASTAPI INIT
@@ -64,19 +68,14 @@ class SecureRAGResponse(BaseModel):
 @app.post("/secure-rag/invoke")
 @limiter.limit("10/minute")
 async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
-
     try:
         # ---- Input Guardrails ----
         detect_prompt_injection(body.question)
         user_input = redact_pii(body.question)
 
-
         # ---- Secure Retrieval ----
-        print(f"DEBUG: user_role = {body.role}")
         retriever = build_secure_retriever(body.role)
-        print(f"DEBUG: retriever type = {type(retriever)}")
         retrieved_docs = retriever(user_input)
-        print(f"DEBUG: retrieved_docs count = {len(retrieved_docs)}")
         context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
         # ---- Streaming Chain ----
@@ -87,49 +86,27 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
 
         rag_chain = setup | secure_prompt | _llm | StrOutputParser()
 
-        async def stream_tokens() -> AsyncGenerator[str, None]:
-            """
-            Yield tokens as they arrive from the LLM.
-            Also run final guardrails after completion.
-            """
+        async def stream_tokens():
             full_answer = ""
-
-            # Stream each token
             async for chunk in rag_chain.astream(user_input):
                 full_answer += chunk
                 yield f"data: {json.dumps({'token': chunk})}\n\n"
 
-            # ---- Output Guardrails (post-stream) ----
+            # Output guardrails
             try:
                 full_answer = model_guard_check(full_answer)
                 full_answer = enforce_one_sentence(full_answer)
                 confidence = compute_confidence(retrieved_docs, full_answer)
-
                 log_event("ANSWER", full_answer)
-
-                # Final message with metadata
-                yield f"""data: {json.dumps({
-                         'done': True,
-                        'answer': full_answer,
-                        'confidence': confidence
-                    })}\n\n"""
-
+                yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence})}\n\n"
             except ValueError as ve:
                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': 'Internal guardrail error'})}\n\n"
 
-        return StreamingResponse(
-            stream_tokens(),
-            media_type="text/event-stream"
-        )
-
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        return StreamingResponse(stream_tokens(), media_type="text/event-stream")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-
+        logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 # ============================================================
 # 5️⃣ HEALTH CHECK

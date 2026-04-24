@@ -24,6 +24,8 @@ from app.secure_rag import (
     enforce_one_sentence,
     compute_confidence,
     log_event,
+    _vectorstore,
+    _embeddings
 )
 
 logger = logging.getLogger(__name__)
@@ -121,7 +123,56 @@ def health():
         "version": "2.0.0",
         "endpoint": "/secure-rag/invoke"
     }
+# ============================================================
+# 6️⃣ DETAILED HEALTH CHECK
+# ============================================================
 
+@app.get("/health")
+async def health_check():
+    """
+    Returns detailed health of all components.
+    """
+    health_status = {
+        "status": "ok",
+        "service": "Tech Secure RAG",
+        "version": "2.0.0",
+        "components": {}
+    }
+
+    # 1. FAISS index check
+    try:
+        if _vectorstore is not None:
+            # Quick test: perform a dummy similarity search
+            _ = _vectorstore.similarity_search("test", k=1)
+            health_status["components"]["faiss"] = "healthy"
+        else:
+            health_status["components"]["faiss"] = "not_loaded"
+            health_status["status"] = "degraded"
+    except Exception as e:
+        health_status["components"]["faiss"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
+
+    # 2. OpenAI embeddings check
+    try:
+        _embeddings.embed_query("health check")
+        health_status["components"]["embeddings"] = "healthy"
+    except Exception as e:
+        health_status["components"]["embeddings"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
+
+    # 3. LLM check (minimal)
+    try:
+        _llm.invoke("ping")
+        health_status["components"]["llm"] = "healthy"
+    except Exception as e:
+        health_status["components"]["llm"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
+
+    # 4. Overall status
+    if all(v == "healthy" for v in health_status["components"].values()):
+        health_status["status"] = "healthy"
+
+    return JSONResponse(content=health_status)
 
 # ============================================================
 # RUN (local dev)

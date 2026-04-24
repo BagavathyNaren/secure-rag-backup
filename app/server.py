@@ -13,6 +13,7 @@ import json
 import traceback
 import logging
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from app.secure_rag import (
     detect_prompt_injection,
     redact_pii,

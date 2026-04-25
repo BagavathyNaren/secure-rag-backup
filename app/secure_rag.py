@@ -62,6 +62,15 @@ def redact_pii(text: str) -> str:
 # Change this line in secure_rag.py
 #INDEX_PATH = "faiss_index"
 
+
+
+# DEBUG - remove after fix
+print(f"📂 Current working directory: {os.getcwd()}")
+print(f"📂 Files in cwd: {os.listdir('.')}")
+print(f"📂 faiss_index exists: {os.path.exists('faiss_index')}")
+if os.path.exists("faiss_index"):
+    print(f"📂 faiss_index contents: {os.listdir('faiss_index')}")
+
 # Temporarily change to a non-existent path to force rebuild
 INDEX_PATH = "faiss_index_nonexistent"
 

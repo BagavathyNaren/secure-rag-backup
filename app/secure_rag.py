@@ -59,7 +59,9 @@ def redact_pii(text: str) -> str:
 # 2️⃣ LOAD PREBUILT FAISS INDEX (FROM REPO)
 # ============================================================
 
-INDEX_PATH = "faiss_index"
+#INDEX_PATH = "faiss_index"
+
+INDEX_PATH = "faiss_index_nonexistent"
 
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 

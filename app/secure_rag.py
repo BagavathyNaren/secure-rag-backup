@@ -59,19 +59,34 @@ def redact_pii(text: str) -> str:
 # 2️⃣ LOAD PREBUILT FAISS INDEX (FROM REPO)
 # ============================================================
 
+# Change this line in secure_rag.py
 #INDEX_PATH = "faiss_index"
 
+# Temporarily change to a non-existent path to force rebuild
 INDEX_PATH = "faiss_index_nonexistent"
 
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-print("✅ Loading prebuilt FAISS index from repo...")
-_vectorstore = FAISS.load_local(
-    INDEX_PATH,
-    _embeddings,
-    allow_dangerous_deserialization=True
-)
-print("✅ FAISS index loaded.")
+if os.path.exists(INDEX_PATH):
+    print("✅ Loading prebuilt FAISS index from repo...")
+    _vectorstore = FAISS.load_local(
+        INDEX_PATH,
+        _embeddings,
+        allow_dangerous_deserialization=True
+    )
+    print("✅ FAISS index loaded.")
+else:
+    print("🔐 No prebuilt index found. Building new FAISS index...")
+    _documents = ingest_all()
+    _chunks = recursive_character_chunking(
+        _documents,
+        chunk_size=600,
+        chunk_overlap=150
+    )
+    _vectorstore = FAISS.from_documents(_chunks, _embeddings)
+    os.makedirs(INDEX_PATH, exist_ok=True)
+    _vectorstore.save_local(INDEX_PATH)
+    print("✅ FAISS index built and saved.")
 
 # ============================================================
 # 3️⃣ ROLE-BASED RETRIEVAL

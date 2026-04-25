@@ -6,6 +6,10 @@ from typing import List
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.document_loaders import Docx2txtLoader
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 # Windows: inject Poppler into PATH for this process (pdf2image dependency)
 # if os.name == "nt":
@@ -27,30 +31,56 @@ def load_text_files(directory: str) -> List[Document]:
         if not filename.endswith(".txt") or filename == "urls.txt":
             continue
         file_path = os.path.join(directory, filename)
-        loader = TextLoader(file_path)
-        docs = loader.load()
-        for doc in docs:
-            doc.metadata["source_type"] = "text"
-            doc.metadata["file_name"] = filename
-        all_docs.extend(docs)
-    return all_docs
+        start = time.time()
 
+        try:
+            loader = TextLoader(file_path)
+            docs = loader.load()
+            elapsed = round(time.time() - start, 2)
+
+            total_chars = sum(len(d.page_content) for d in docs)
+            logger.info(f"[TXT] ✅ {filename} | {len(docs)} docs | {total_chars} chars | {elapsed}s")
+
+            for doc in docs:
+                doc.metadata["source_type"] = "text"
+                doc.metadata["file_name"] = filename
+            all_docs.extend(docs)
+
+        except Exception as e:
+            elapsed = round(time.time() - start, 2)
+            logger.error(f"[TXT] ❌ {filename} | Failed after {elapsed}s | {e}")
+
+    return all_docs
 
 # ============================================================
 # LOADER 2: PDF FILES (Smart — handles text + scanned)
 # ============================================================
 
 
-def load_pdf(file_path: str):
+def load_pdf(file_path: str) -> List[Document]:
+    from langchain_community.document_loaders import PyPDFLoader
+
+    filename = os.path.basename(file_path)
+    start = time.time()
+
     try:
         loader = PyPDFLoader(file_path)
         docs = loader.load()
-        print(f"[PDF] Loaded using PyPDF: {file_path}")
-        return docs
-    except Exception as e:
-        print(f"[PDF] Failed to load {file_path}: {e}")
-        return []
+        elapsed = round(time.time() - start, 2)
 
+        total_chars = sum(len(d.page_content) for d in docs)
+        logger.info(f"[PDF] ✅ {filename} | {len(docs)} pages | {total_chars} chars | {elapsed}s")
+
+        for doc in docs:
+            doc.metadata["source_type"] = "pdf"
+            doc.metadata["file_name"] = filename
+
+        return docs
+
+    except Exception as e:
+        elapsed = round(time.time() - start, 2)
+        logger.error(f"[PDF] ❌ {filename} | Failed after {elapsed}s | {e}")
+        return []
 
 # ============================================================
 # LOADER 3: CSV FILES
@@ -70,21 +100,34 @@ def load_csv(file_path: str) -> List[Document]:
 # ============================================================
 # LOADER 4: DOCX FILES
 # ============================================================
-def load_docx_files(directory: str):
-    documents = []
-    
-    for file in os.listdir(directory):
-        if file.endswith(".docx"):
-            file_path = os.path.join(directory, file)
-            try:
-                loader = Docx2txtLoader(file_path)
-                docs = loader.load()
-                print(f"[DOCX] Loaded using Docx2txt: {file_path}")
-                documents.extend(docs)
-            except Exception as e:
-                print(f"[DOCX] Failed to load {file_path}: {e}")
-    
-    return documents
+def load_docx_files(directory: str) -> List[Document]:
+    from langchain_community.document_loaders import Docx2txtLoader
+
+    all_docs = []
+    for filename in os.listdir(directory):
+        if not filename.endswith(".docx"):
+            continue
+        file_path = os.path.join(directory, filename)
+        start = time.time()
+
+        try:
+            loader = Docx2txtLoader(file_path)
+            docs = loader.load()
+            elapsed = round(time.time() - start, 2)
+
+            total_chars = sum(len(d.page_content) for d in docs)
+            logger.info(f"[DOCX] ✅ {filename} | {len(docs)} docs | {total_chars} chars | {elapsed}s")
+
+            for doc in docs:
+                doc.metadata["source_type"] = "docx"
+                doc.metadata["file_name"] = filename
+            all_docs.extend(docs)
+
+        except Exception as e:
+            elapsed = round(time.time() - start, 2)
+            logger.error(f"[DOCX] ❌ {filename} | Failed after {elapsed}s | {e}")
+
+    return all_docs
 
 
 # ============================================================
@@ -142,14 +185,10 @@ def load_web_pages(urls: List[str]) -> List[Document]:
 # MASTER INGESTION FUNCTION
 # ============================================================
 def ingest_all() -> List[Document]:
-    """
-    Runs all loaders, combines results, prints a report.
-    """
+    start_total = time.time()
 
-    # Load text files
     txt_docs = load_text_files("data/")
 
-    # == Dynamic PDF loading — picks up every .pdf in data/ ==
     pdf_docs = []
     for filename in os.listdir("data/"):
         if not filename.endswith(".pdf"):
@@ -157,7 +196,6 @@ def ingest_all() -> List[Document]:
         file_path = os.path.join("data/", filename)
         pdf_docs.extend(load_pdf(file_path))
 
-    # == Dynamic CSV loading — picks up every .csv in data/ ==
     csv_docs = []
     for filename in os.listdir("data/"):
         if not filename.endswith(".csv"):
@@ -166,42 +204,36 @@ def ingest_all() -> List[Document]:
         csv_docs.extend(load_csv(file_path))
 
     docx_docs = load_docx_files("data/")
-
     excel_docs = load_excel_files("data/")
 
-    with open("data/urls.txt", "r") as f:
-        urls = [line.strip() for line in f if line.strip()]
-    web_docs = load_web_pages(urls)
+    # Web pages (optional)
+    web_docs = []
+    urls_path = "data/urls.txt"
+    if os.path.exists(urls_path):
+        with open(urls_path, "r") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        web_docs = load_web_pages(urls)
 
     all_docs = txt_docs + pdf_docs + csv_docs + docx_docs + excel_docs + web_docs
 
-    # -- Ingestion Report ----------------------------------
-    print("\n" + "=" * 60)
-    print("INGESTION REPORT")
-    print("=" * 60)
-    print(f"Text files:   {len(txt_docs)} documents")
-    print(f"PDF pages:    {len(pdf_docs)} documents")
-    print(f"CSV rows:     {len(csv_docs)} documents")
-    print(f"DOCX files:   {len(docx_docs)} documents")
-    print(f"Excel rows:   {len(excel_docs)} documents")
-    print(f"Web pages:    {len(web_docs)} documents")
-    print("-" * 40)
-    print(f"TOTAL:        {len(all_docs)} documents")
-    print("=" * 60)
+    elapsed_total = round(time.time() - start_total, 2)
 
-    # -- Sample from each source type ----------------------
-    for source_type in ["text", "pdf", "csv", "docx", "excel", "web"]:
-        sample = next(
-            (d for d in all_docs if d.metadata.get("source_type") == source_type),
-            None,
-        )
-        if sample:
-            print(f"\nSample [{source_type}]:")
-            print(f"  Content:  {sample.page_content[:120]}...")
-            print(f"  Metadata: {sample.metadata}")
+    # ---- Structured Report ----
+    logger.info("=" * 60)
+    logger.info("📊 INGESTION REPORT")
+    logger.info("=" * 60)
+    logger.info(f"  📄 Text files:   {len(txt_docs)} documents")
+    logger.info(f"  📕 PDF pages:    {len(pdf_docs)} documents")
+    logger.info(f"  📊 CSV rows:     {len(csv_docs)} documents")
+    logger.info(f"  📝 DOCX files:   {len(docx_docs)} documents")
+    logger.info(f"  📗 Excel rows:   {len(excel_docs)} documents")
+    logger.info(f"  🌐 Web pages:    {len(web_docs)} documents")
+    logger.info("-" * 40)
+    logger.info(f"  📦 TOTAL:        {len(all_docs)} documents")
+    logger.info(f"  ⏱️  Time:         {elapsed_total}s")
+    logger.info("=" * 60)
 
     return all_docs
-
 
 # ============================================================
 # RUN

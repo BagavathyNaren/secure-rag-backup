@@ -97,7 +97,6 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
             # Output guardrails
             try:
                 full_answer = model_guard_check(full_answer)
-                full_answer = enforce_one_sentence(full_answer)
                 confidence = compute_confidence(retrieved_docs, full_answer)
                 log_event("ANSWER", full_answer)
                 yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence})}\n\n"

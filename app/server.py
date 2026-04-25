@@ -21,7 +21,6 @@ from app.secure_rag import (
     secure_prompt,
     _llm,
     model_guard_check,
-    enforce_one_sentence,
     compute_confidence,
     log_event,
     _vectorstore,

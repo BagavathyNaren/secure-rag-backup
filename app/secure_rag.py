@@ -18,17 +18,19 @@ from app.chunking import recursive_character_chunking
 
 
 # ============================================================
-# AUDIT LOGGER (Structured JSON)
+# AUDIT LOGGER — PER-REQUEST TRACE ID
 # ============================================================
 
 class AuditLogger:
-    def __init__(self):
-        self.request_id = str(uuid.uuid4())
+    """
+    Each call to secure_rag_invoke() creates a NEW trace_id.
+    This gives us full per-request tracing in the logs.
+    """
 
-    def log(self, event: str, data: dict = None):
+    def log(self, event: str, trace_id: str, data: dict = None):
         entry = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "request_id": self.request_id,
+            "trace_id": trace_id,       # Unique per request
             "event": event,
             **(data or {})
         }
@@ -36,21 +38,24 @@ class AuditLogger:
 
 audit = AuditLogger()
 
+def new_trace_id() -> str:
+    """Generate a fresh unique trace ID for every request"""
+    return str(uuid.uuid4())
+
 
 # ============================================================
-# BACKWARDS COMPATIBLE log_event (fixes server.py crash)
+# BACKWARDS COMPATIBLE log_event
 # server.py calls: log_event("ANSWER", some_string)
-# New logger expects: audit.log("ANSWER", {"key": "value"})
-# This wrapper handles BOTH formats
 # ============================================================
 
 def log_event(event_type: str, data):
+    """Legacy compatibility wrapper for server.py"""
     if isinstance(data, str):
-        audit.log(event_type, {"message": data})
+        audit.log(event_type, trace_id="legacy", data={"message": data})
     elif isinstance(data, dict):
-        audit.log(event_type, data)
+        audit.log(event_type, trace_id="legacy", data=data)
     else:
-        audit.log(event_type, {"data": str(data)})
+        audit.log(event_type, trace_id="legacy", data={"data": str(data)})
 
 
 # ============================================================
@@ -66,10 +71,13 @@ DANGEROUS_PATTERNS = [
     r"ghp_",
 ]
 
-def pre_filter_check(answer: str) -> str:
+def pre_filter_check(answer: str, trace_id: str) -> str:
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, answer, re.IGNORECASE):
-            audit.log("SECURITY_BLOCK", {"trigger": "pre_filter", "pattern": pattern})
+            audit.log("SECURITY_BLOCK", trace_id, {
+                "trigger": "pre_filter",
+                "pattern": pattern
+            })
             raise ValueError("SECURITY BLOCK: Credential detected.")
     return answer
 
@@ -85,14 +93,20 @@ INJECTION_PATTERNS = [
     r"reveal confidential",
 ]
 
-def detect_prompt_injection(user_input: str):
+def detect_prompt_injection(user_input: str, trace_id: str = "unknown"):
     if any(re.search(p, user_input, re.IGNORECASE) for p in INJECTION_PATTERNS):
-        audit.log("PROMPT_INJECTION", {"input": user_input[:100]})
+        audit.log("PROMPT_INJECTION_DETECTED", trace_id, {
+            "input_preview": user_input[:100],
+            "action": "BLOCKED"
+        })
         raise ValueError("Prompt injection detected.")
 
-def redact_pii(text: str) -> str:
+def redact_pii(text: str, trace_id: str = "unknown") -> str:
+    original = text
     text = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "[EMAIL]", text)
     text = re.sub(r"\b(?:\d[ -]*?){13,16}\b", "[CARD]", text)
+    if text != original:
+        audit.log("PII_REDACTED", trace_id, {"note": "PII found and redacted"})
     return text
 
 
@@ -116,12 +130,12 @@ else:
     os.makedirs(INDEX_PATH, exist_ok=True)
     _vectorstore.save_local(INDEX_PATH)
 
-def build_secure_retriever(user_role: str):
+def build_secure_retriever(user_role: str, trace_id: str):
     allowed = {
         "employee": ["company_policy.txt", "engineering_standards.docx"],
         "security": ["security_policy.txt"],
-        "finance": ["finance_policy.txt"],
-        "admin": None,
+        "finance":  ["finance_policy.txt"],
+        "admin":    None,
     }.get(user_role, [])
 
     retriever = _vectorstore.as_retriever(search_kwargs={"k": 4})
@@ -129,8 +143,9 @@ def build_secure_retriever(user_role: str):
     if user_role == "admin":
         def admin_retrieve(q):
             docs = retriever.invoke(q)
-            audit.log("RETRIEVAL", {
+            audit.log("RETRIEVAL", trace_id, {
                 "role": "admin",
+                "doc_count": len(docs),
                 "sources": [d.metadata.get("file_name") for d in docs]
             })
             return docs
@@ -139,10 +154,12 @@ def build_secure_retriever(user_role: str):
     def role_retrieve(q):
         docs = retriever.invoke(q)
         filtered = [d for d in docs if d.metadata.get("file_name") in allowed]
-        audit.log("RETRIEVAL", {
+        audit.log("RETRIEVAL", trace_id, {
             "role": user_role,
-            "allowed": allowed,
-            "returned": len(filtered)
+            "allowed_sources": allowed,
+            "retrieved": len(docs),
+            "returned": len(filtered),
+            "sources": [d.metadata.get("file_name") for d in filtered]
         })
         return filtered
     return role_retrieve
@@ -175,9 +192,9 @@ _llm = ChatOpenAI(
 # OUTPUT GUARDRAIL + CONFIDENCE
 # ============================================================
 
-def model_guard_check(answer: str, context: str = "") -> str:
+def model_guard_check(answer: str, trace_id: str, context: str = "") -> str:
     if any(re.search(p, answer, re.IGNORECASE) for p in DANGEROUS_PATTERNS):
-        audit.log("SECURITY_BLOCK", {"trigger": "final_guard"})
+        audit.log("SECURITY_BLOCK", trace_id, {"trigger": "output_guard"})
         raise ValueError("SECURITY BLOCK: Credential detected in output.")
     return answer
 
@@ -192,19 +209,29 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
 
 
 # ============================================================
-# MAIN FUNCTION
+# MAIN FUNCTION — FULL PER-REQUEST TRACE ID
 # ============================================================
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
-    audit.log("REQUEST", {"question": user_input, "role": user_role})
+
+    # ✅ Fresh unique trace ID for EVERY request
+    trace_id = new_trace_id()
+
+    audit.log("REQUEST_START", trace_id, {
+        "role": user_role,
+        "question_preview": user_input[:80]
+    })
 
     try:
-        detect_prompt_injection(user_input)
-        clean_input = redact_pii(user_input)
+        # Input Guardrails
+        detect_prompt_injection(user_input, trace_id)
+        clean_input = redact_pii(user_input, trace_id)
 
-        docs = build_secure_retriever(user_role)(clean_input)
+        # Retrieval
+        docs = build_secure_retriever(user_role, trace_id)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
+        # Generation
         chain = (
             RunnableParallel(
                 context=lambda _: context,
@@ -216,21 +243,25 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
         )
         answer = chain.invoke(clean_input)
 
-        # Triple defense
-        answer = pre_filter_check(answer)
-        answer = model_guard_check(answer, context)
+        # Triple Nuclear Defense
+        answer = pre_filter_check(answer, trace_id)
+        answer = model_guard_check(answer, trace_id, context)
 
         confidence = compute_confidence(docs, answer)
 
-        audit.log("SUCCESS", {
+        audit.log("REQUEST_SUCCESS", trace_id, {
             "confidence": confidence,
-            "answer_length": len(answer)
+            "answer_length": len(answer),
+            "sources_used": [d.metadata.get("file_name") for d in docs]
         })
 
         return {"answer": answer, "confidence": confidence}
 
     except Exception as e:
-        audit.log("BLOCKED", {"error": str(e)})
+        audit.log("REQUEST_FAILED", trace_id, {
+            "error": str(e),
+            "role": user_role
+        })
         return {
             "answer": "I cannot assist with that request due to security restrictions.",
             "confidence": "BLOCKED"

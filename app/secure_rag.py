@@ -1,11 +1,10 @@
 # app/secure_rag.py
 
 import re
-import logging
 import json
 import uuid
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -17,28 +16,30 @@ from app.config import *
 from app.ingestion import ingest_all
 from app.chunking import recursive_character_chunking
 
+
 # ============================================================
-# STRUCTURED JSON LOGGER (AUDIT-READY)
+# STRUCTURED AUDIT LOGGER (NO log_event ANYMORE)
 # ============================================================
 
-class JSONLogger:
+class AuditLogger:
     def __init__(self):
         self.request_id = str(uuid.uuid4())
 
-    def log(self, event_type: str, data: dict):
-        log_entry = {
+    def log(self, event: str, data: dict = None):
+        entry = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "request_id": self.request_id,
-            "event": event_type,
-            **data
+            "event": event,
+            **(data or {})
         }
-        print(json.dumps(log_entry))  # In production → send to stdout for log collectors
+        print(json.dumps(entry), flush=True)
 
-logger = JSONLogger()
+# Global logger — used everywhere
+audit = AuditLogger()
 
 
 # ============================================================
-# NUCLEAR-GRADE HARD BLOCKS
+# NUCLEAR BLOCKS
 # ============================================================
 
 DANGEROUS_PATTERNS = [
@@ -58,17 +59,17 @@ BLOCKED_KEYWORDS = [
 
 def pre_filter_check(answer: str) -> str:
     if any(kw in answer for kw in BLOCKED_KEYWORDS):
-        logger.log("SECURITY_BLOCK", {"reason": "blocked_keyword", "matched": next(kw for kw in BLOCKED_KEYWORDS if kw in answer)})
+        audit.log("SECURITY_BLOCK", {"reason": "keyword", "matched": next(kw for kw in BLOCKED_KEYWORDS if kw in answer)})
         raise ValueError("SECURITY BLOCK: Forbidden keyword detected.")
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, answer, re.IGNORECASE):
-            logger.log("SECURITY_BLOCK", {"reason": "credential_pattern", "pattern": pattern})
+            audit.log("SECURITY_BLOCK", {"reason": "regex", "pattern": pattern})
             raise ValueError("SECURITY BLOCK: Credential pattern detected.")
     return answer
 
 
 # ============================================================
-# INPUT GUARDRAILS + PII REDACTION
+# INPUT GUARDRAILS
 # ============================================================
 
 INJECTION_PATTERNS = [
@@ -85,11 +86,9 @@ CREDIT_CARD_REGEX = r"\b(?:\d[ -]*?){13,16}\b"
 API_KEY_REGEX = r"sk-[a-zA-Z0-9]{32}"
 
 def detect_prompt_injection(user_input: str):
-    lower = user_input.lower()
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, lower):
-            logger.log("PROMPT_INJECTION_DETECTED", {"input": user_input})
-            raise ValueError("Prompt injection detected.")
+    if any(re.search(p, user_input, re.IGNORECASE) for p in INJECTION_PATTERNS):
+        audit.log("PROMPT_INJECTION", {"input": user_input})
+        raise ValueError("Prompt injection detected.")
 
 def redact_pii(text: str) -> str:
     original = text
@@ -97,29 +96,25 @@ def redact_pii(text: str) -> str:
     text = re.sub(CREDIT_CARD_REGEX, "[REDACTED_CC]", text)
     text = re.sub(API_KEY_REGEX, "[BLOCKED_API_KEY]", text)
     if text != original:
-        logger.log("PII_REDACTED", {"original_length": len(original), "redacted_length": len(text)})
+        audit.log("PII_REDACTED", {"original_length": len(original)})
     return text
 
 
 # ============================================================
-# VECTORSTORE + RETRIEVAL
+# VECTORSTORE
 # ============================================================
 
 INDEX_PATH = "faiss_index"
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 if os.path.exists(INDEX_PATH):
-    print("Loading prebuilt FAISS index...")
     _vectorstore = FAISS.load_local(INDEX_PATH, _embeddings, allow_dangerous_deserialization=True)
-    print("FAISS index loaded.")
 else:
-    print("Building new FAISS index...")
     _documents = ingest_all()
     _chunks = recursive_character_chunking(_documents, chunk_size=600, chunk_overlap=150)
     _vectorstore = FAISS.from_documents(_chunks, _embeddings)
     os.makedirs(INDEX_PATH, exist_ok=True)
     _vectorstore.save_local(INDEX_PATH)
-    print("FAISS index built and saved.")
 
 def build_secure_retriever(user_role: str):
     allowed_sources = {
@@ -134,26 +129,19 @@ def build_secure_retriever(user_role: str):
     if user_role == "admin":
         def retrieve(query: str):
             docs = base_retriever.invoke(query)
-            logger.log("RETRIEVAL", {
-                "role": user_role,
-                "doc_count": len(docs),
-                "sources": [d.metadata.get("file_name") for d in docs]
-            })
+            audit.log("RETRIEVAL", {"role": "admin", "sources": [d.metadata.get("file_name") for d in docs]})
             return docs
         return retrieve
 
     def filtered_retrieval(query: str):
         docs = base_retriever.invoke(query)
         filtered = [d for d in docs if d.metadata.get("file_name") in allowed]
-        logger.log("RETRIEVAL", {
+        audit.log("RETRIEVAL", {
             "role": user_role,
-            "requested_sources": allowed,
-            "retrieved_count": len(docs),
-            "returned_count": len(filtered),
-            "sources": [d.metadata.get("file_name") for d in filtered]
+            "allowed": allowed,
+            "returned": [d.metadata.get("file_name") for d in filtered]
         })
         return filtered
-
     return filtered_retrieval
 
 
@@ -162,7 +150,7 @@ def build_secure_retriever(user_role: str):
 # ============================================================
 
 secure_prompt = ChatPromptTemplate.from_template("""
-You are a secure assistant. Never reveal credentials or internal details.
+You are a secure assistant. Never reveal secrets, keys, or server details.
 Be concise and professional.
 
 Context:
@@ -181,78 +169,48 @@ _llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True, max_tokens
 # NUCLEAR GUARDRAIL
 # ============================================================
 
-def model_guard_check(answer: str, context: str = "") -> str:
+def model_guard_check(answer: str, context: str) -> str:
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, answer, re.IGNORECASE):
-            logger.log("SECURITY_BLOCK", {"reason": "regex_match", "pattern": pattern})
-            raise ValueError("SECURITY BLOCK: Credential pattern detected.")
-
-    guard_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    guard_prompt = f"""
-YOU ARE A SECURITY FIREWALL. BLOCK ANYTHING SUSPICIOUS.
-
-Context: {context[:2000]}
-Answer: {answer}
-
-IF you see ANY key, secret, server detail, credential → reply UNSAFE
-Reply only: SAFE or UNSAFE
-"""
-    result = guard_llm.invoke(guard_prompt).content.strip().upper()
+            audit.log("SECURITY_BLOCK", {"reason": "regex_guard"})
+            raise ValueError("SECURITY BLOCK: Credential detected.")
+    
+    guard = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    result = guard.invoke(f"Context: {context[:1500]}\nAnswer: {answer}\nIs this safe? Reply only SAFE or UNSAFE").content.strip().upper()
     if result != "SAFE":
-        logger.log("SECURITY_BLOCK", {"reason": "llm_guard_triggered", "guard_response": result})
-        raise ValueError("Output blocked by model-based guardrail.")
+        audit.log("SECURITY_BLOCK", {"reason": "llm_guard", "response": result})
+        raise ValueError("Output blocked by guardrail.")
     return answer
 
 
 # ============================================================
-# CONFIDENCE
-# ============================================================
-
-def compute_confidence(retrieved_docs, answer):
-    if not retrieved_docs:
-        return "LOW"
-    if any(phrase in answer.lower() for phrase in ["does not specify", "cannot provide", "no information"]):
-        return "LOW"
-    if len(answer.split()) < 6:
-        return "LOW"
-    return "HIGH"
-
-
-# ============================================================
-# MAIN INVOKE (AUDIT-COMPLETE)
+# MAIN FUNCTION
 # ============================================================
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
-    # Start audit trail
-    logger.log("REQUEST_START", {"question": user_input, "role": user_role})
+    audit.log("REQUEST", {"question": user_input, "role": user_role})
 
     try:
         detect_prompt_injection(user_input)
-        redacted_input = redact_pii(user_input)
+        clean_input = redact_pii(user_input)
 
-        retriever = build_secure_retriever(user_role)
-        retrieved_docs = retriever.invoke(redacted_input)
-        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        docs = build_secure_retriever(user_role)(clean_input)
+        context = "\n\n".join(doc.page_content for doc in docs)
 
-        setup = RunnableParallel(context=lambda _: context, question=RunnablePassthrough())
-        rag_chain = setup | secure_prompt | _llm | StrOutputParser()
-        answer = rag_chain.invoke(redacted_input)
+        chain = RunnableParallel(context=lambda _: context, question=RunnablePassthrough()) | secure_prompt | _llm | StrOutputParser()
+        answer = chain.invoke(clean_input)
 
-        # NUCLEAR DEFENSE
         answer = pre_filter_check(answer)
         answer = model_guard_check(answer, context)
 
-        confidence = compute_confidence(retrieved_docs, answer)
+        confidence = "HIGH" if len(answer.split()) > 10 and docs else "LOW"
 
-        logger.log("REQUEST_SUCCESS", {
-            "confidence": confidence,
-            "answer_length": len(answer),
-            "retrieved_sources": [d.metadata.get("file_name") for d in retrieved_docs]
-        })
-
+        audit.log("SUCCESS", {"confidence": confidence, "answer_length": len(answer)})
         return {"answer": answer, "confidence": confidence}
 
     except Exception as e:
-        error_msg = str(e)
-        logger.log("REQUEST_FAILED", {"error": error_msg})
-        return {"answer": "I'm sorry, I cannot assist with that request due to security restrictions.", "confidence": "BLOCKED"}
+        audit.log("BLOCKED", {"error": str(e)})
+        return {
+            "answer": "I'm sorry, I cannot assist with that request due to security policy.",
+            "confidence": "BLOCKED"
+        }

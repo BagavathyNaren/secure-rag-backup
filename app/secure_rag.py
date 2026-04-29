@@ -22,15 +22,10 @@ from app.chunking import recursive_character_chunking
 # ============================================================
 
 class AuditLogger:
-    """
-    Each call to secure_rag_invoke() creates a NEW trace_id.
-    This gives us full per-request tracing in the logs.
-    """
-
-    def log(self, event: str, trace_id: str, data: dict = None):
+    def log(self, event: str, trace_id: str = "system", data: dict = None):
         entry = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "trace_id": trace_id,       # Unique per request
+            "trace_id": trace_id,
             "event": event,
             **(data or {})
         }
@@ -39,23 +34,20 @@ class AuditLogger:
 audit = AuditLogger()
 
 def new_trace_id() -> str:
-    """Generate a fresh unique trace ID for every request"""
     return str(uuid.uuid4())
 
 
 # ============================================================
 # BACKWARDS COMPATIBLE log_event
-# server.py calls: log_event("ANSWER", some_string)
 # ============================================================
 
 def log_event(event_type: str, data):
-    """Legacy compatibility wrapper for server.py"""
     if isinstance(data, str):
-        audit.log(event_type, trace_id="legacy", data={"message": data})
+        audit.log(event_type, data={"message": data})
     elif isinstance(data, dict):
-        audit.log(event_type, trace_id="legacy", data=data)
+        audit.log(event_type, data=data)
     else:
-        audit.log(event_type, trace_id="legacy", data={"data": str(data)})
+        audit.log(event_type, data={"data": str(data)})
 
 
 # ============================================================
@@ -71,7 +63,7 @@ DANGEROUS_PATTERNS = [
     r"ghp_",
 ]
 
-def pre_filter_check(answer: str, trace_id: str) -> str:
+def pre_filter_check(answer: str, trace_id: str = "system") -> str:
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, answer, re.IGNORECASE):
             audit.log("SECURITY_BLOCK", trace_id, {
@@ -93,7 +85,7 @@ INJECTION_PATTERNS = [
     r"reveal confidential",
 ]
 
-def detect_prompt_injection(user_input: str, trace_id: str = "unknown"):
+def detect_prompt_injection(user_input: str, trace_id: str = "system"):
     if any(re.search(p, user_input, re.IGNORECASE) for p in INJECTION_PATTERNS):
         audit.log("PROMPT_INJECTION_DETECTED", trace_id, {
             "input_preview": user_input[:100],
@@ -101,7 +93,7 @@ def detect_prompt_injection(user_input: str, trace_id: str = "unknown"):
         })
         raise ValueError("Prompt injection detected.")
 
-def redact_pii(text: str, trace_id: str = "unknown") -> str:
+def redact_pii(text: str, trace_id: str = "system") -> str:
     original = text
     text = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "[EMAIL]", text)
     text = re.sub(r"\b(?:\d[ -]*?){13,16}\b", "[CARD]", text)
@@ -130,7 +122,9 @@ else:
     os.makedirs(INDEX_PATH, exist_ok=True)
     _vectorstore.save_local(INDEX_PATH)
 
-def build_secure_retriever(user_role: str, trace_id: str):
+
+# ✅ trace_id is now OPTIONAL — server.py can call with just (role)
+def build_secure_retriever(user_role: str, trace_id: str = "system"):
     allowed = {
         "employee": ["company_policy.txt", "engineering_standards.docx"],
         "security": ["security_policy.txt"],
@@ -192,7 +186,8 @@ _llm = ChatOpenAI(
 # OUTPUT GUARDRAIL + CONFIDENCE
 # ============================================================
 
-def model_guard_check(answer: str, trace_id: str, context: str = "") -> str:
+# ✅ context and trace_id are both optional
+def model_guard_check(answer: str, context: str = "", trace_id: str = "system") -> str:
     if any(re.search(p, answer, re.IGNORECASE) for p in DANGEROUS_PATTERNS):
         audit.log("SECURITY_BLOCK", trace_id, {"trigger": "output_guard"})
         raise ValueError("SECURITY BLOCK: Credential detected in output.")
@@ -214,7 +209,7 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
 
-    # ✅ Fresh unique trace ID for EVERY request
+    # Fresh unique trace ID for EVERY single request
     trace_id = new_trace_id()
 
     audit.log("REQUEST_START", trace_id, {
@@ -227,7 +222,7 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
         detect_prompt_injection(user_input, trace_id)
         clean_input = redact_pii(user_input, trace_id)
 
-        # Retrieval
+        # Retrieval — pass trace_id for full tracing
         docs = build_secure_retriever(user_role, trace_id)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
@@ -245,7 +240,7 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
 
         # Triple Nuclear Defense
         answer = pre_filter_check(answer, trace_id)
-        answer = model_guard_check(answer, trace_id, context)
+        answer = model_guard_check(answer, context, trace_id)
 
         confidence = compute_confidence(docs, answer)
 

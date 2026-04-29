@@ -16,8 +16,9 @@ from app.config import *
 from app.ingestion import ingest_all
 from app.chunking import recursive_character_chunking
 
+
 # ============================================================
-# AUDIT LOGGER
+# AUDIT LOGGER (Structured JSON)
 # ============================================================
 
 class AuditLogger:
@@ -34,6 +35,22 @@ class AuditLogger:
         print(json.dumps(entry), flush=True)
 
 audit = AuditLogger()
+
+
+# ============================================================
+# BACKWARDS COMPATIBLE log_event (fixes server.py crash)
+# server.py calls: log_event("ANSWER", some_string)
+# New logger expects: audit.log("ANSWER", {"key": "value"})
+# This wrapper handles BOTH formats
+# ============================================================
+
+def log_event(event_type: str, data):
+    if isinstance(data, str):
+        audit.log(event_type, {"message": data})
+    elif isinstance(data, dict):
+        audit.log(event_type, data)
+    else:
+        audit.log(event_type, {"data": str(data)})
 
 
 # ============================================================
@@ -62,7 +79,10 @@ def pre_filter_check(answer: str) -> str:
 # ============================================================
 
 INJECTION_PATTERNS = [
-    r"ignore previous", r"disregard", r"system prompt", r"reveal confidential"
+    r"ignore previous",
+    r"disregard",
+    r"system prompt",
+    r"reveal confidential",
 ]
 
 def detect_prompt_injection(user_input: str):
@@ -84,7 +104,11 @@ INDEX_PATH = "faiss_index"
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 if os.path.exists(INDEX_PATH):
-    _vectorstore = FAISS.load_local(INDEX_PATH, _embeddings, allow_dangerous_deserialization=True)
+    _vectorstore = FAISS.load_local(
+        INDEX_PATH,
+        _embeddings,
+        allow_dangerous_deserialization=True
+    )
 else:
     docs = ingest_all()
     chunks = recursive_character_chunking(docs, chunk_size=600, chunk_overlap=150)
@@ -105,14 +129,21 @@ def build_secure_retriever(user_role: str):
     if user_role == "admin":
         def admin_retrieve(q):
             docs = retriever.invoke(q)
-            audit.log("RETRIEVAL", {"role": "admin", "sources": [d.metadata.get("file_name") for d in docs]})
+            audit.log("RETRIEVAL", {
+                "role": "admin",
+                "sources": [d.metadata.get("file_name") for d in docs]
+            })
             return docs
         return admin_retrieve
 
     def role_retrieve(q):
         docs = retriever.invoke(q)
         filtered = [d for d in docs if d.metadata.get("file_name") in allowed]
-        audit.log("RETRIEVAL", {"role": user_role, "allowed": allowed, "returned": len(filtered)})
+        audit.log("RETRIEVAL", {
+            "role": user_role,
+            "allowed": allowed,
+            "returned": len(filtered)
+        })
         return filtered
     return role_retrieve
 
@@ -132,22 +163,30 @@ Question: {question}
 Answer (be concise):
 """)
 
-_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True, max_tokens=450)
+_llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    streaming=True,
+    max_tokens=450
+)
 
 
 # ============================================================
-# GUARDRAIL + CONFIDENCE
+# OUTPUT GUARDRAIL + CONFIDENCE
 # ============================================================
 
-# 👇 ADDED "= ''" here so server.py doesn't crash when it calls it!
 def model_guard_check(answer: str, context: str = "") -> str:
     if any(re.search(p, answer, re.IGNORECASE) for p in DANGEROUS_PATTERNS):
         audit.log("SECURITY_BLOCK", {"trigger": "final_guard"})
-        raise ValueError("SECURITY BLOCK")
+        raise ValueError("SECURITY BLOCK: Credential detected in output.")
     return answer
 
 def compute_confidence(retrieved_docs, answer: str) -> str:
-    if not retrieved_docs or len(answer) < 30 or "cannot" in answer.lower():
+    if not retrieved_docs:
+        return "LOW"
+    if len(answer) < 30:
+        return "LOW"
+    if any(p in answer.lower() for p in ["cannot", "don't know", "no information"]):
         return "LOW"
     return "HIGH"
 
@@ -166,15 +205,28 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
         docs = build_secure_retriever(user_role)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
-        chain = RunnableParallel(context=lambda _: context, question=RunnablePassthrough()) | secure_prompt | _llm | StrOutputParser()
+        chain = (
+            RunnableParallel(
+                context=lambda _: context,
+                question=RunnablePassthrough()
+            )
+            | secure_prompt
+            | _llm
+            | StrOutputParser()
+        )
         answer = chain.invoke(clean_input)
 
+        # Triple defense
         answer = pre_filter_check(answer)
         answer = model_guard_check(answer, context)
 
         confidence = compute_confidence(docs, answer)
 
-        audit.log("SUCCESS", {"confidence": confidence, "length": len(answer)})
+        audit.log("SUCCESS", {
+            "confidence": confidence,
+            "answer_length": len(answer)
+        })
+
         return {"answer": answer, "confidence": confidence}
 
     except Exception as e:
@@ -183,6 +235,3 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
             "answer": "I cannot assist with that request due to security restrictions.",
             "confidence": "BLOCKED"
         }
-
-# For backwards compatibility with your server.py
-log_event = audit.log  

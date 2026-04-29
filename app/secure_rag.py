@@ -1,5 +1,4 @@
 # app/secure_rag.py
-# FINAL VERSION — GUARANTEED TO START
 
 import re
 import json
@@ -17,9 +16,8 @@ from app.config import *
 from app.ingestion import ingest_all
 from app.chunking import recursive_character_chunking
 
-
 # ============================================================
-# AUDIT LOGGER (structured JSON logs)
+# AUDIT LOGGER
 # ============================================================
 
 class AuditLogger:
@@ -141,7 +139,8 @@ _llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True, max_tokens
 # GUARDRAIL + CONFIDENCE
 # ============================================================
 
-def model_guard_check(answer: str, context: str) -> str:
+# 👇 ADDED "= ''" here so server.py doesn't crash when it calls it!
+def model_guard_check(answer: str, context: str = "") -> str:
     if any(re.search(p, answer, re.IGNORECASE) for p in DANGEROUS_PATTERNS):
         audit.log("SECURITY_BLOCK", {"trigger": "final_guard"})
         raise ValueError("SECURITY BLOCK")
@@ -154,7 +153,7 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
 
 
 # ============================================================
-# MAIN FUNCTION — EXACTLY WHAT server.py EXPECTS
+# MAIN FUNCTION
 # ============================================================
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
@@ -185,6 +184,5 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
             "confidence": "BLOCKED"
         }
 
-
-# Keep these for backward compatibility if server.py still imports them
-log_event = audit.log  # ← fixes old imports
+# For backwards compatibility with your server.py
+log_event = audit.log  

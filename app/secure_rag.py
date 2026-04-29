@@ -103,27 +103,67 @@ def redact_pii(text: str, trace_id: str = "system") -> str:
 
 
 # ============================================================
-# VECTORSTORE & RETRIEVAL
+# VECTORSTORE & RETRIEVAL (+ STARTUP/CACHE LOGS)
 # ============================================================
 
 INDEX_PATH = "faiss_index"
-_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 
-if os.path.exists(INDEX_PATH):
-    _vectorstore = FAISS.load_local(
-        INDEX_PATH,
-        _embeddings,
-        allow_dangerous_deserialization=True
-    )
+_embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+
+def _faiss_ntotal(vs) -> int:
+    """Best-effort count of vectors in the FAISS index."""
+    try:
+        return int(vs.index.ntotal)
+    except Exception:
+        return -1
+
+_index_exists = os.path.exists(INDEX_PATH)
+
+audit.log("FAISS_INDEX_CHECK", "startup", {
+    "index_path": INDEX_PATH,
+    "exists": _index_exists,
+    "embedding_model": EMBEDDING_MODEL_NAME
+})
+
+if _index_exists:
+    audit.log("FAISS_INDEX_LOAD_START", "startup", {"index_path": INDEX_PATH})
+
+    try:
+        _vectorstore = FAISS.load_local(
+            INDEX_PATH,
+            _embeddings,
+            allow_dangerous_deserialization=True
+        )
+    except Exception as e:
+        audit.log("FAISS_INDEX_LOAD_FAILED", "startup", {
+            "index_path": INDEX_PATH,
+            "error": str(e)
+        })
+        raise
+
+    audit.log("FAISS_INDEX_LOADED", "startup", {
+        "index_path": INDEX_PATH,
+        "ntotal": _faiss_ntotal(_vectorstore)
+    })
 else:
-    docs = ingest_all()
-    chunks = recursive_character_chunking(docs, chunk_size=600, chunk_overlap=150)
-    _vectorstore = FAISS.from_documents(chunks, _embeddings)
+    audit.log("FAISS_INDEX_BUILD_START", "startup", {"index_path": INDEX_PATH})
+
+    _documents = ingest_all()
+    _chunks = recursive_character_chunking(_documents, chunk_size=600, chunk_overlap=150)
+    _vectorstore = FAISS.from_documents(_chunks, _embeddings)
+
     os.makedirs(INDEX_PATH, exist_ok=True)
     _vectorstore.save_local(INDEX_PATH)
 
+    audit.log("FAISS_INDEX_BUILT_AND_SAVED", "startup", {
+        "index_path": INDEX_PATH,
+        "ntotal": _faiss_ntotal(_vectorstore),
+        "chunk_count": len(_chunks)
+    })
 
-# ✅ trace_id is now OPTIONAL — server.py can call with just (role)
+
+# ✅ trace_id is optional — server.py can call with just (role)
 def build_secure_retriever(user_role: str, trace_id: str = "system"):
     allowed = {
         "employee": ["company_policy.txt", "engineering_standards.docx"],
@@ -186,7 +226,6 @@ _llm = ChatOpenAI(
 # OUTPUT GUARDRAIL + CONFIDENCE
 # ============================================================
 
-# ✅ context and trace_id are both optional
 def model_guard_check(answer: str, context: str = "", trace_id: str = "system") -> str:
     if any(re.search(p, answer, re.IGNORECASE) for p in DANGEROUS_PATTERNS):
         audit.log("SECURITY_BLOCK", trace_id, {"trigger": "output_guard"})
@@ -208,8 +247,6 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
 # ============================================================
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
-
-    # Fresh unique trace ID for EVERY single request
     trace_id = new_trace_id()
 
     audit.log("REQUEST_START", trace_id, {
@@ -218,15 +255,12 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
     })
 
     try:
-        # Input Guardrails
         detect_prompt_injection(user_input, trace_id)
         clean_input = redact_pii(user_input, trace_id)
 
-        # Retrieval — pass trace_id for full tracing
         docs = build_secure_retriever(user_role, trace_id)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
-        # Generation
         chain = (
             RunnableParallel(
                 context=lambda _: context,
@@ -238,7 +272,6 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
         )
         answer = chain.invoke(clean_input)
 
-        # Triple Nuclear Defense
         answer = pre_filter_check(answer, trace_id)
         answer = model_guard_check(answer, context, trace_id)
 

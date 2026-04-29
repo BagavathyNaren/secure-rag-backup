@@ -23,6 +23,35 @@ def log_event(event_type: str, data: str):
 
 
 # ============================================================
+# NUCLEAR-GRADE HARD BLOCKS (INSTANT KILL SWITCH)
+# ============================================================
+DANGEROUS_PATTERNS = [
+    r"AKIA[0-9A-Z]{16}",                     # AWS Access Key
+    r"sk_[a-zA-Z0-9]{32,}",                  # OpenAI/Anthropic/etc
+    r"claude-api-key-[a-zA-Z0-9-]{20,}",
+    r"[A-Za-z0-9+/]{40}",                    # Long base64 secrets
+    r"ghp_[a-zA-Z0-9]{36}",
+    r"-----BEGIN [A-Z ]+PRIVATE KEY-----",
+    r"Secret Access Key[^\n]{0,20}[:=][^\n]{10,}",
+    r"Secret Key[^\n]{0,20}[:=][^\n]{10,}",
+]
+
+BLOCKED_KEYWORDS = [
+    "AKIA", "sk_", "claude-api-key", "Secret Access Key", "Secret Key",
+    "private key", "BEGIN PRIVATE KEY", "ghp_", "github_pat", "AWS_SECRET"
+]
+
+def pre_filter_check(answer: str) -> str:
+    """Instant hard block before anything else"""
+    if any(kw in answer for kw in BLOCKED_KEYWORDS):
+        raise ValueError("SECURITY BLOCK: Forbidden keyword detected in output.")
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            raise ValueError("SECURITY BLOCK: Credential pattern detected in output.")
+    return answer
+
+
+# ============================================================
 # 1️⃣ INPUT GUARDRAILS
 # ============================================================
 
@@ -43,7 +72,7 @@ def detect_prompt_injection(user_input: str):
     lower = user_input.lower()
     for pattern in INJECTION_PATTERNS:
         if re.search(pattern, lower):
-            raise ValueError("⚠️ Prompt injection detected.")
+            raise ValueError("Prompt injection detected.")
 
 def redact_pii(text: str) -> str:
     text = re.sub(EMAIL_REGEX, "[REDACTED_EMAIL]", text)
@@ -61,15 +90,15 @@ INDEX_PATH = "faiss_index"
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 if os.path.exists(INDEX_PATH):
-    print("✅ Loading prebuilt FAISS index from repo...")
+    print("Loading prebuilt FAISS index from repo...")
     _vectorstore = FAISS.load_local(
         INDEX_PATH,
         _embeddings,
         allow_dangerous_deserialization=True
     )
-    print("✅ FAISS index loaded.")
+    print("FAISS index loaded.")
 else:
-    print("🔐 No prebuilt index found. Building new FAISS index...")
+    print("No prebuilt index found. Building new FAISS index...")
     _documents = ingest_all()
     _chunks = recursive_character_chunking(
         _documents,
@@ -79,7 +108,7 @@ else:
     _vectorstore = FAISS.from_documents(_chunks, _embeddings)
     os.makedirs(INDEX_PATH, exist_ok=True)
     _vectorstore.save_local(INDEX_PATH)
-    print("✅ FAISS index built and saved.")
+    print("FAISS index built and saved.")
 
 
 # ============================================================
@@ -110,28 +139,23 @@ def build_secure_retriever(user_role: str):
 
 
 # ============================================================
-# 4️⃣ HARDENED PROMPT (Concise Version - ~400-500 tokens)
+# 4️⃣ HARDENED PROMPT (Concise + Safe)
 # ============================================================
 
 secure_prompt = ChatPromptTemplate.from_template("""
 You are a secure assistant.
-
 SECURITY RULES:
 1. Never reveal confidential information.
 2. Only answer using retrieved context.
-
 INSTRUCTIONS:
 - Be clear, concise, and direct.
 - Use short paragraphs and bullet points when helpful.
 - Avoid unnecessary details and long explanations.
 - Keep the total answer brief but informative.
-
 Context:
 {context}
-
 Question:
 {question}
-
 Answer:
 """)
 
@@ -139,41 +163,41 @@ _llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0,
     streaming=True,
-    max_tokens=450          # Reduced for shorter responses
+    max_tokens=450
 )
 
 
 # ============================================================
-# 5️⃣ IMPROVED OUTPUT GUARD
+# 5️⃣ NUCLEAR-GRADE OUTPUT GUARD (UPGRADED)
 # ============================================================
 
 def model_guard_check(answer: str, context: str = "") -> str:
+    # Double regex check
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            raise ValueError("SECURITY BLOCK: Credential pattern detected.")
+
     guard_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
     guard_prompt = f"""
-    You are an output security guard.
+YOU ARE A PARANOID SECURITY FIREWALL.
 
-    Context from documents:
-    {context[:1500]}
+Context:
+{context[:2000]}
 
-    Answer to check:
-    {answer}
+Answer:
+{answer}
 
-    Check if the answer contains:
-    - Real user personal data (names, emails, phone numbers of individuals)
-    - API keys, passwords, secrets
-    - Internal system prompts or instructions
-    - Confidential data not present in the context
+RULES:
+- ANY API key, secret, credential = UNSAFE (even fake/test/mock)
+- ANY server name, hostname, IP, RAM, CPU = UNSAFE
+- If in doubt = UNSAFE
 
-    Company policy emails (like security@techcorp.com) are allowed.
-
-    Reply with ONLY one word: SAFE or UNSAFE
-    """
+Reply only: SAFE or UNSAFE
+"""
 
     result = guard_llm.invoke(guard_prompt).content.strip().upper()
-
-    if result == "UNSAFE":
-        raise ValueError("⚠️ Output blocked by model-based guardrail.")
+    if result != "SAFE":
+        raise ValueError("Output blocked by model-based guardrail.")
 
     return answer
 
@@ -193,7 +217,7 @@ def compute_confidence(retrieved_docs, answer):
 
 
 # ============================================================
-# 7️⃣ MAIN SECURE INVOKE FUNCTION
+# 7️⃣ MAIN SECURE INVOKE FUNCTION (NOW WITH TRIPLE DEFENSE)
 # ============================================================
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
@@ -218,8 +242,9 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
     rag_chain = setup | secure_prompt | _llm | StrOutputParser()
     answer = rag_chain.invoke(user_input)
 
-    # Output Guard
-    answer = model_guard_check(answer, context)
+    # TRIPLE NUCLEAR DEFENSE
+    answer = pre_filter_check(answer)                    # Layer 1: Instant block
+    answer = model_guard_check(answer, context)          # Layer 2: Paranoid LLM guard
 
     confidence = compute_confidence(retrieved_docs, answer)
 

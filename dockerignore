@@ -1,13 +1,38 @@
+# Dependencies & Environments
 __pycache__
 *.pyc
+*.pyo
+venv
+.venv
+env
 .env
+node_modules
+
+# IDE & OS
 .git
-*.egg-info
-Lib/
-Scripts/
-Include/
-share/
-etc/
-pkgs/
-python.exe
-*.dll
+.gitignore
+.DS_Store
+.vscode
+.idea
+*.md
+LICENSE
+
+# Local Data & Logs
+*.log
+logs/
+tmp/
+temp/
+data/
+!faiss_index/
+
+# Testing
+tests/
+test_*.py
+*_test.py
+pytest_cache
+.coverage
+htmlcov
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints

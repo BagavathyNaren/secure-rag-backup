@@ -75,6 +75,81 @@ def pre_filter_check(answer: str, trace_id: str = "system") -> str:
 
 
 # ============================================================
+# ✅ NEW — THING 2
+# CONTEXT CREDENTIAL SCANNER
+# Scans RAW retrieved context BEFORE sending to LLM.
+# If credentials are found → block immediately.
+# LLM never sees the sensitive data.
+# ============================================================
+
+SENSITIVE_CONTEXT_PATTERNS = [
+    r"AKIA[0-9A-Z]{16}",                         # AWS Access Key ID
+    r"claude-api-key-[a-zA-Z0-9\-]{10,}",        # Claude API key
+    r"-----BEGIN\s+[A-Z ]+PRIVATE KEY-----",      # Private keys
+    r"ghp_[a-zA-Z0-9]{36}",                      # GitHub PAT
+    r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}",  # Secret Access Key: value
+    r"(?i)access.{0,5}key.{0,5}id\s*[:=]\s*[A-Z0-9]{10,}",# Access Key ID: value
+    r"sk_[a-zA-Z0-9]{32,}",                      # OpenAI/Stripe keys
+]
+
+def scan_context_for_credentials(context: str, trace_id: str = "system") -> None:
+    """
+    Scans the raw retrieved context BEFORE passing to LLM.
+    If any credential pattern is found → raise immediately.
+    This is the earliest possible block point.
+    """
+    for pattern in SENSITIVE_CONTEXT_PATTERNS:
+        if re.search(pattern, context, re.IGNORECASE):
+            audit.log("CONTEXT_CREDENTIAL_BLOCK", trace_id, {
+                "reason": "credentials_found_in_retrieved_context",
+                "pattern": pattern,
+                "action": "BLOCKED_BEFORE_GENERATION"
+            })
+            raise ValueError(
+                "SECURITY BLOCK: Retrieved context contains sensitive credentials. "
+                "Request blocked before LLM generation."
+            )
+
+
+# ============================================================
+# ✅ NEW — THING 1
+# SENSITIVE ANSWER TERM SCANNER
+# Blocks answers that DESCRIBE credentials even without raw values.
+# e.g. "The document contains a fake AWS access key..." → BLOCKED
+# ============================================================
+
+SENSITIVE_ANSWER_TERMS = [
+    r"(?i)(api\s*key|secret\s*key|access\s*key|private\s*key)",
+    r"(?i)(aws|s3).{0,20}(key|credential|secret|token)",
+    r"(?i)(fake|mock|test|simulated|non-functional).{0,40}(key|credential|secret|token)",
+    r"(?i)(credential|credentials).{0,30}(fake|mock|test|simulated|demo)",
+    r"(?i)claude.{0,10}api.{0,10}key",
+    r"(?i)(access\s*key\s*id|secret\s*access\s*key)",
+]
+
+def scan_answer_for_sensitive_terms(answer: str, trace_id: str = "system") -> str:
+    """
+    Scans the LLM answer for descriptions of credentials
+    even when raw credential values are not present.
+    Catches answers like:
+    - 'The document contains a fake AWS access key'
+    - 'There is a Claude API key in the file'
+    - 'Simulated credentials are present'
+    """
+    for pattern in SENSITIVE_ANSWER_TERMS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            audit.log("SECURITY_BLOCK", trace_id, {
+                "trigger": "sensitive_term_in_answer",
+                "pattern": pattern,
+                "action": "BLOCKED_AFTER_GENERATION"
+            })
+            raise ValueError(
+                "SECURITY BLOCK: Answer references sensitive credential terms."
+            )
+    return answer
+
+
+# ============================================================
 # INPUT GUARDRAILS
 # ============================================================
 
@@ -112,7 +187,6 @@ EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 _embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
 
 def _faiss_ntotal(vs) -> int:
-    """Best-effort count of vectors in the FAISS index."""
     try:
         return int(vs.index.ntotal)
     except Exception:
@@ -128,7 +202,6 @@ audit.log("FAISS_INDEX_CHECK", "startup", {
 
 if _index_exists:
     audit.log("FAISS_INDEX_LOAD_START", "startup", {"index_path": INDEX_PATH})
-
     try:
         _vectorstore = FAISS.load_local(
             INDEX_PATH,
@@ -141,21 +214,17 @@ if _index_exists:
             "error": str(e)
         })
         raise
-
     audit.log("FAISS_INDEX_LOADED", "startup", {
         "index_path": INDEX_PATH,
         "ntotal": _faiss_ntotal(_vectorstore)
     })
 else:
     audit.log("FAISS_INDEX_BUILD_START", "startup", {"index_path": INDEX_PATH})
-
     _documents = ingest_all()
     _chunks = recursive_character_chunking(_documents, chunk_size=600, chunk_overlap=150)
     _vectorstore = FAISS.from_documents(_chunks, _embeddings)
-
     os.makedirs(INDEX_PATH, exist_ok=True)
     _vectorstore.save_local(INDEX_PATH)
-
     audit.log("FAISS_INDEX_BUILT_AND_SAVED", "startup", {
         "index_path": INDEX_PATH,
         "ntotal": _faiss_ntotal(_vectorstore),
@@ -163,7 +232,6 @@ else:
     })
 
 
-# ✅ trace_id is optional — server.py can call with just (role)
 def build_secure_retriever(user_role: str, trace_id: str = "system"):
     allowed = {
         "employee": ["company_policy.txt", "engineering_standards.docx"],
@@ -255,12 +323,18 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
     })
 
     try:
+        # Input guardrails
         detect_prompt_injection(user_input, trace_id)
         clean_input = redact_pii(user_input, trace_id)
 
+        # Retrieval
         docs = build_secure_retriever(user_role, trace_id)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
+        # ✅ NEW THING 2 — scan context BEFORE LLM sees it
+        scan_context_for_credentials(context, trace_id)
+
+        # Generation
         chain = (
             RunnableParallel(
                 context=lambda _: context,
@@ -272,7 +346,9 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
         )
         answer = chain.invoke(clean_input)
 
+        # ✅ NEW THING 1 — block credential descriptions in answer
         answer = pre_filter_check(answer, trace_id)
+        answer = scan_answer_for_sensitive_terms(answer, trace_id)  # ← NEW
         answer = model_guard_check(answer, context, trace_id)
 
         confidence = compute_confidence(docs, answer)

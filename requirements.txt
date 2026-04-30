@@ -33,3 +33,6 @@ sentence-transformers
 chromadb
 langchain-core
 huggingface_hub
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart

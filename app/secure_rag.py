@@ -3,8 +3,10 @@
 import re
 import json
 import uuid
+import hashlib
+import time
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -12,6 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 import os
+
 from app.config import *
 from app.ingestion import ingest_all
 from app.chunking import recursive_character_chunking
@@ -27,7 +30,7 @@ class AuditLogger:
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "trace_id": trace_id,
             "event": event,
-            **(data or {})
+            **(data or {}),
         }
         print(json.dumps(entry), flush=True)
 
@@ -51,6 +54,77 @@ def log_event(event_type: str, data):
 
 
 # ============================================================
+# ✅ LLM ANSWER CACHE
+# ============================================================
+
+class LLMCache:
+    """
+    In-memory TTL cache for LLM answers.
+
+    Key   : SHA256(role + "|" + normalized_question)
+    Value : {"answer": str, "confidence": str}
+    TTL   : 300 seconds (5 minutes) by default
+    Max   : 200 entries — FIFO eviction when full
+    """
+    def __init__(self, ttl_seconds: int = 300, max_entries: int = 200):
+        self._store: Dict[str, dict] = {}
+        self._ttl = ttl_seconds
+        self._max = max_entries
+
+    def _make_key(self, role: str, question: str) -> str:
+        normalized = question.strip().lower()
+        raw = f"{role}|{normalized}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def get(self, role: str, question: str) -> Optional[dict]:
+        key = self._make_key(role, question)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() > entry["expires_at"]:
+            del self._store[key]
+            return None
+        return entry["value"]
+
+    def set(self, role: str, question: str, value: dict) -> None:
+        if len(self._store) >= self._max:
+            oldest_key = next(iter(self._store))
+            del self._store[oldest_key]
+
+        key = self._make_key(role, question)
+        self._store[key] = {
+            "value": value,
+            "expires_at": time.monotonic() + self._ttl,
+        }
+
+    def invalidate(self, role: str, question: str) -> None:
+        self._store.pop(self._make_key(role, question), None)
+
+    def clear(self) -> int:
+        count = len(self._store)
+        self._store.clear()
+        return count
+
+    def stats(self) -> dict:
+        now = time.monotonic()
+        active = sum(1 for e in self._store.values() if e["expires_at"] > now)
+        expired = len(self._store) - active
+        return {
+            "total_entries": len(self._store),
+            "active_entries": active,
+            "expired_entries": expired,
+            "ttl_seconds": self._ttl,
+            "max_entries": self._max,
+        }
+
+
+# Global cache instance
+llm_cache = LLMCache(ttl_seconds=300, max_entries=200)
+
+audit.log("CACHE_INIT", "startup", {"ttl_seconds": 300, "max_entries": 200})
+
+
+# ============================================================
 # NUCLEAR BLOCKS
 # ============================================================
 
@@ -66,44 +140,32 @@ DANGEROUS_PATTERNS = [
 def pre_filter_check(answer: str, trace_id: str = "system") -> str:
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, answer, re.IGNORECASE):
-            audit.log("SECURITY_BLOCK", trace_id, {
-                "trigger": "pre_filter",
-                "pattern": pattern
-            })
+            audit.log("SECURITY_BLOCK", trace_id, {"trigger": "pre_filter", "pattern": pattern})
             raise ValueError("SECURITY BLOCK: Credential detected.")
     return answer
 
 
 # ============================================================
-# ✅ NEW — THING 2
 # CONTEXT CREDENTIAL SCANNER
-# Scans RAW retrieved context BEFORE sending to LLM.
-# If credentials are found → block immediately.
-# LLM never sees the sensitive data.
 # ============================================================
 
 SENSITIVE_CONTEXT_PATTERNS = [
-    r"AKIA[0-9A-Z]{16}",                         # AWS Access Key ID
-    r"claude-api-key-[a-zA-Z0-9\-]{10,}",        # Claude API key
-    r"-----BEGIN\s+[A-Z ]+PRIVATE KEY-----",      # Private keys
-    r"ghp_[a-zA-Z0-9]{36}",                      # GitHub PAT
-    r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}",  # Secret Access Key: value
-    r"(?i)access.{0,5}key.{0,5}id\s*[:=]\s*[A-Z0-9]{10,}",# Access Key ID: value
-    r"sk_[a-zA-Z0-9]{32,}",                      # OpenAI/Stripe keys
+    r"AKIA[0-9A-Z]{16}",
+    r"claude-api-key-[a-zA-Z0-9\-]{10,}",
+    r"-----BEGIN\s+[A-Z ]+PRIVATE KEY-----",
+    r"ghp_[a-zA-Z0-9]{36}",
+    r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}",
+    r"(?i)access.{0,5}key.{0,5}id\s*[:=]\s*[A-Z0-9]{10,}",
+    r"sk_[a-zA-Z0-9]{32,}",
 ]
 
 def scan_context_for_credentials(context: str, trace_id: str = "system") -> None:
-    """
-    Scans the raw retrieved context BEFORE passing to LLM.
-    If any credential pattern is found → raise immediately.
-    This is the earliest possible block point.
-    """
     for pattern in SENSITIVE_CONTEXT_PATTERNS:
         if re.search(pattern, context, re.IGNORECASE):
             audit.log("CONTEXT_CREDENTIAL_BLOCK", trace_id, {
                 "reason": "credentials_found_in_retrieved_context",
                 "pattern": pattern,
-                "action": "BLOCKED_BEFORE_GENERATION"
+                "action": "BLOCKED_BEFORE_GENERATION",
             })
             raise ValueError(
                 "SECURITY BLOCK: Retrieved context contains sensitive credentials. "
@@ -112,10 +174,7 @@ def scan_context_for_credentials(context: str, trace_id: str = "system") -> None
 
 
 # ============================================================
-# ✅ NEW — THING 1
 # SENSITIVE ANSWER TERM SCANNER
-# Blocks answers that DESCRIBE credentials even without raw values.
-# e.g. "The document contains a fake AWS access key..." → BLOCKED
 # ============================================================
 
 SENSITIVE_ANSWER_TERMS = [
@@ -128,24 +187,14 @@ SENSITIVE_ANSWER_TERMS = [
 ]
 
 def scan_answer_for_sensitive_terms(answer: str, trace_id: str = "system") -> str:
-    """
-    Scans the LLM answer for descriptions of credentials
-    even when raw credential values are not present.
-    Catches answers like:
-    - 'The document contains a fake AWS access key'
-    - 'There is a Claude API key in the file'
-    - 'Simulated credentials are present'
-    """
     for pattern in SENSITIVE_ANSWER_TERMS:
         if re.search(pattern, answer, re.IGNORECASE):
             audit.log("SECURITY_BLOCK", trace_id, {
                 "trigger": "sensitive_term_in_answer",
                 "pattern": pattern,
-                "action": "BLOCKED_AFTER_GENERATION"
+                "action": "BLOCKED_AFTER_GENERATION",
             })
-            raise ValueError(
-                "SECURITY BLOCK: Answer references sensitive credential terms."
-            )
+            raise ValueError("SECURITY BLOCK: Answer references sensitive credential terms.")
     return answer
 
 
@@ -164,7 +213,7 @@ def detect_prompt_injection(user_input: str, trace_id: str = "system"):
     if any(re.search(p, user_input, re.IGNORECASE) for p in INJECTION_PATTERNS):
         audit.log("PROMPT_INJECTION_DETECTED", trace_id, {
             "input_preview": user_input[:100],
-            "action": "BLOCKED"
+            "action": "BLOCKED",
         })
         raise ValueError("Prompt injection detected.")
 
@@ -178,12 +227,11 @@ def redact_pii(text: str, trace_id: str = "system") -> str:
 
 
 # ============================================================
-# VECTORSTORE & RETRIEVAL (+ STARTUP/CACHE LOGS)
+# VECTORSTORE & RETRIEVAL (WITH STARTUP LOGS)
 # ============================================================
 
 INDEX_PATH = "faiss_index"
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
-
 _embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
 
 def _faiss_ntotal(vs) -> int:
@@ -197,7 +245,7 @@ _index_exists = os.path.exists(INDEX_PATH)
 audit.log("FAISS_INDEX_CHECK", "startup", {
     "index_path": INDEX_PATH,
     "exists": _index_exists,
-    "embedding_model": EMBEDDING_MODEL_NAME
+    "embedding_model": EMBEDDING_MODEL_NAME,
 })
 
 if _index_exists:
@@ -206,17 +254,15 @@ if _index_exists:
         _vectorstore = FAISS.load_local(
             INDEX_PATH,
             _embeddings,
-            allow_dangerous_deserialization=True
+            allow_dangerous_deserialization=True,
         )
     except Exception as e:
-        audit.log("FAISS_INDEX_LOAD_FAILED", "startup", {
-            "index_path": INDEX_PATH,
-            "error": str(e)
-        })
+        audit.log("FAISS_INDEX_LOAD_FAILED", "startup", {"error": str(e)})
         raise
+
     audit.log("FAISS_INDEX_LOADED", "startup", {
         "index_path": INDEX_PATH,
-        "ntotal": _faiss_ntotal(_vectorstore)
+        "ntotal": _faiss_ntotal(_vectorstore),
     })
 else:
     audit.log("FAISS_INDEX_BUILD_START", "startup", {"index_path": INDEX_PATH})
@@ -228,7 +274,7 @@ else:
     audit.log("FAISS_INDEX_BUILT_AND_SAVED", "startup", {
         "index_path": INDEX_PATH,
         "ntotal": _faiss_ntotal(_vectorstore),
-        "chunk_count": len(_chunks)
+        "chunk_count": len(_chunks),
     })
 
 
@@ -236,8 +282,8 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
     allowed = {
         "employee": ["company_policy.txt", "engineering_standards.docx"],
         "security": ["security_policy.txt"],
-        "finance":  ["finance_policy.txt"],
-        "admin":    None,
+        "finance": ["finance_policy.txt"],
+        "admin": None,
     }.get(user_role, [])
 
     retriever = _vectorstore.as_retriever(search_kwargs={"k": 4})
@@ -248,7 +294,7 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
             audit.log("RETRIEVAL", trace_id, {
                 "role": "admin",
                 "doc_count": len(docs),
-                "sources": [d.metadata.get("file_name") for d in docs]
+                "sources": [d.metadata.get("file_name") for d in docs],
             })
             return docs
         return admin_retrieve
@@ -261,9 +307,10 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
             "allowed_sources": allowed,
             "retrieved": len(docs),
             "returned": len(filtered),
-            "sources": [d.metadata.get("file_name") for d in filtered]
+            "sources": [d.metadata.get("file_name") for d in filtered],
         })
         return filtered
+
     return role_retrieve
 
 
@@ -274,10 +321,23 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
 secure_prompt = ChatPromptTemplate.from_template("""
 You are a secure company assistant. Never reveal secrets, keys, or server details.
 
+STRICT ANSWERING RULES:
+- Answer using ONLY facts that are explicitly stated in the Context.
+- Do NOT use general knowledge or make assumptions.
+- Do NOT substitute related information for the requested information.
+- If the Context does not contain the exact requested detail, reply:
+  "Not specified in the provided context."
+
+ACCESS-AWARE RULES:
+- The user role is: {role}
+- You may ONLY answer from the retrieved sources listed below: {sources}
+- If the question asks about a domain/policy (e.g., finance/security) but the retrieved sources do not include that domain, explicitly say you may not have access to that policy and answer only what is available (or say it's not specified).
+
 Context:
 {context}
 
-Question: {question}
+Question:
+{question}
 
 Answer (be concise):
 """)
@@ -286,7 +346,7 @@ _llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0,
     streaming=True,
-    max_tokens=450
+    max_tokens=450,
 )
 
 
@@ -300,18 +360,35 @@ def model_guard_check(answer: str, context: str = "", trace_id: str = "system") 
         raise ValueError("SECURITY BLOCK: Credential detected in output.")
     return answer
 
+# ✅ UPDATED: downgrades "not specified" to LOW
 def compute_confidence(retrieved_docs, answer: str) -> str:
     if not retrieved_docs:
         return "LOW"
+
+    a = (answer or "").lower()
+
+    low_markers = [
+        "not specified",
+        "not provided in the context",
+        "not in the provided context",
+        "not available in the provided context",
+        "cannot provide",
+        "can't provide",
+        "don't know",
+        "do not know",
+        "no information",
+    ]
+    if any(m in a for m in low_markers):
+        return "LOW"
+
     if len(answer) < 30:
         return "LOW"
-    if any(p in answer.lower() for p in ["cannot", "don't know", "no information"]):
-        return "LOW"
+
     return "HIGH"
 
 
 # ============================================================
-# MAIN FUNCTION — FULL PER-REQUEST TRACE ID
+# MAIN FUNCTION — WITH CACHING
 # ============================================================
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
@@ -319,7 +396,7 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
 
     audit.log("REQUEST_START", trace_id, {
         "role": user_role,
-        "question_preview": user_input[:80]
+        "question_preview": user_input[:80],
     })
 
     try:
@@ -327,46 +404,86 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
         detect_prompt_injection(user_input, trace_id)
         clean_input = redact_pii(user_input, trace_id)
 
+        # ✅ Check cache FIRST
+        cached = llm_cache.get(user_role, clean_input)
+        if cached:
+            audit.log("CACHE_HIT", trace_id, {
+                "role": user_role,
+                "confidence": cached["confidence"],
+            })
+            return {
+                "answer": cached["answer"],
+                "confidence": cached["confidence"],
+                "cached": True,
+            }
+
+        audit.log("CACHE_MISS", trace_id, {"role": user_role})
+
         # Retrieval
         docs = build_secure_retriever(user_role, trace_id)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
-        # ✅ NEW THING 2 — scan context BEFORE LLM sees it
+        # Sources string for prompt (role-aware, source-aware)
+        sources_str = ", ".join(
+            sorted(set(d.metadata.get("file_name") for d in docs if d.metadata.get("file_name")))
+        ) or "none"
+
+        # Scan context BEFORE LLM
         scan_context_for_credentials(context, trace_id)
 
         # Generation
-        chain = (
-            RunnableParallel(
-                context=lambda _: context,
-                question=RunnablePassthrough()
-            )
-            | secure_prompt
-            | _llm
-            | StrOutputParser()
+        setup = RunnableParallel(
+            context=lambda _: context,
+            question=RunnablePassthrough(),
+            role=lambda _: user_role,
+            sources=lambda _: sources_str,
         )
+        chain = setup | secure_prompt | _llm | StrOutputParser()
         answer = chain.invoke(clean_input)
 
-        # ✅ NEW THING 1 — block credential descriptions in answer
+        # Output guards
         answer = pre_filter_check(answer, trace_id)
-        answer = scan_answer_for_sensitive_terms(answer, trace_id)  # ← NEW
+        answer = scan_answer_for_sensitive_terms(answer, trace_id)
         answer = model_guard_check(answer, context, trace_id)
 
         confidence = compute_confidence(docs, answer)
 
+        # ✅ Cache only HIGH-confidence answers
+        if confidence == "HIGH":
+            llm_cache.set(user_role, clean_input, {
+                "answer": answer,
+                "confidence": confidence,
+            })
+            audit.log("CACHE_STORED", trace_id, {
+                "role": user_role,
+                "confidence": confidence,
+                "cache_stats": llm_cache.stats(),
+            })
+        else:
+            audit.log("CACHE_SKIPPED", trace_id, {
+                "role": user_role,
+                "confidence": confidence,
+                "reason": "low_confidence",
+            })
+
         audit.log("REQUEST_SUCCESS", trace_id, {
             "confidence": confidence,
             "answer_length": len(answer),
-            "sources_used": [d.metadata.get("file_name") for d in docs]
+            "sources_used": [d.metadata.get("file_name") for d in docs],
         })
 
-        return {"answer": answer, "confidence": confidence}
+        return {
+            "answer": answer,
+            "confidence": confidence,
+            "cached": False,
+        }
 
     except Exception as e:
         audit.log("REQUEST_FAILED", trace_id, {
             "error": str(e),
-            "role": user_role
+            "role": user_role,
         })
         return {
             "answer": "I cannot assist with that request due to security restrictions.",
-            "confidence": "BLOCKED"
+            "confidence": "BLOCKED",
         }

@@ -411,19 +411,25 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
         docs    = build_secure_retriever(user_role, trace_id)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
+        # ✅ ADD HERE: sources string for prompt (role-aware, source-aware)
+        sources_str = ", ".join(
+            sorted(
+                set(d.metadata.get("file_name") for d in docs if d.metadata.get("file_name"))
+            )
+        ) or "none"
+
         # Scan context BEFORE LLM
         scan_context_for_credentials(context, trace_id)
 
         # Generation
-        chain = (
-            RunnableParallel(
-                context=lambda _: context,
-                question=RunnablePassthrough()
-            )
-            | secure_prompt
-            | _llm
-            | StrOutputParser()
+        setup = RunnableParallel(
+            context=lambda _: context,
+            question=RunnablePassthrough(),
+            role=lambda _: user_role,
+            sources=lambda _: sources_str,
         )
+
+        chain = setup | secure_prompt | _llm | StrOutputParser()
         answer = chain.invoke(clean_input)
 
         # Output guards

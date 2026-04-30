@@ -1,12 +1,11 @@
 # app/auth.py
 
 import os
-import json
+import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
@@ -19,67 +18,64 @@ from fastapi.security import OAuth2PasswordBearer
 # JWT_ALGORITHM   → HS256 (default)
 # JWT_EXPIRE_MINS → 60 (default)
 
-SECRET_KEY   = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_USE_LONG_RANDOM_STRING")
-ALGORITHM    = os.getenv("JWT_ALGORITHM", "HS256")
-EXPIRE_MINS  = int(os.getenv("JWT_EXPIRE_MINS", "60"))
+SECRET_KEY  = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_USE_LONG_RANDOM_STRING")
+ALGORITHM   = os.getenv("JWT_ALGORITHM", "HS256")
+EXPIRE_MINS = int(os.getenv("JWT_EXPIRE_MINS", "60"))
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 # ============================================================
-# MOCK USER DATABASE
-# In production → replace with real DB (PostgreSQL, etc.)
-# Passwords are bcrypt hashed.
-#
-# To generate a hashed password in Python:
-#   from passlib.context import CryptContext
-#   pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-#   print(pwd_context.hash("your_password_here"))
+# PASSWORD HELPERS (pure bcrypt — no passlib)
 # ============================================================
 
+def hash_password(plain: str) -> str:
+    """Hash a plain text password using bcrypt."""
+    return bcrypt.hashpw(
+        plain[:72].encode("utf-8"),      # bcrypt hard limit = 72 bytes
+        bcrypt.gensalt()
+    ).decode("utf-8")
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """Verify a plain text password against a bcrypt hash."""
+    return bcrypt.checkpw(
+        plain[:72].encode("utf-8"),      # same 72 byte limit
+        hashed.encode("utf-8")
+    )
+
+
+# ============================================================
+# MOCK USER DATABASE
+# Passwords are bcrypt hashed at module load time.
+#
+# In production → replace with real DB (PostgreSQL, etc.)
+#
+# To generate a hash manually in Python:
+#   import bcrypt
+#   print(bcrypt.hashpw(b"your_password", bcrypt.gensalt()).decode())
+# ============================================================
+
+def _make_user(user_id, username, email, role, password) -> dict:
+    return {
+        "user_id":         user_id,
+        "username":        username,
+        "email":           email,
+        "role":            role,
+        "hashed_password": hash_password(password),
+        "active":          True,
+    }
+
 USERS_DB: Dict[str, dict] = {
-    "alice": {
-        "user_id":       "usr_001",
-        "username":      "alice",
-        "email":         "alice@techcorp.com",
-        "role":          "employee",
-        "hashed_password": pwd_context.hash("employee_pass_123"),
-        "active":        True,
-    },
-    "bob": {
-        "user_id":       "usr_002",
-        "username":      "bob",
-        "email":         "bob@techcorp.com",
-        "role":          "finance",
-        "hashed_password": pwd_context.hash("finance_pass_456"),
-        "active":        True,
-    },
-    "carol": {
-        "user_id":       "usr_003",
-        "username":      "carol",
-        "email":         "carol@techcorp.com",
-        "role":          "security",
-        "hashed_password": pwd_context.hash("security_pass_789"),
-        "active":        True,
-    },
-    "dave": {
-        "user_id":       "usr_004",
-        "username":      "dave",
-        "email":         "dave@techcorp.com",
-        "role":          "admin",
-        "hashed_password": pwd_context.hash("admin_pass_000"),
-        "active":        True,
-    },
+    "alice": _make_user("usr_001", "alice", "alice@techcorp.com", "employee", "employee_pass"),
+    "bob":   _make_user("usr_002", "bob",   "bob@techcorp.com",   "finance",  "finance_pass"),
+    "carol": _make_user("usr_003", "carol", "carol@techcorp.com", "security", "security_pass"),
+    "dave":  _make_user("usr_004", "dave",  "dave@techcorp.com",  "admin",    "admin_pass"),
 }
 
 
 # ============================================================
-# PASSWORD HELPERS
+# USER AUTHENTICATION
 # ============================================================
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
 
 def authenticate_user(username: str, password: str) -> Optional[dict]:
     user = USERS_DB.get(username)
@@ -104,22 +100,24 @@ def create_access_token(user: dict) -> str:
     - email    : user email
     - role     : role assigned by SERVER (cannot be faked by client)
     - exp      : expiry timestamp
+    - iat      : issued at
     """
     expire = datetime.utcnow() + timedelta(minutes=EXPIRE_MINS)
     payload = {
         "sub":     user["username"],
         "user_id": user["user_id"],
         "email":   user["email"],
-        "role":    user["role"],          # ← role set by SERVER
+        "role":    user["role"],       # ← role set by SERVER, not client
         "exp":     expire,
-        "iat":     datetime.utcnow(),     # issued at
+        "iat":     datetime.utcnow(),
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
 
 def decode_token(token: str) -> dict:
     """
     Decodes and validates JWT token.
-    Raises HTTPException if invalid or expired.
+    Raises HTTPException 401 if invalid or expired.
     """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -140,14 +138,13 @@ def decode_token(token: str) -> dict:
 
 
 # ============================================================
-# FASTAPI DEPENDENCY — use in any endpoint
+# FASTAPI DEPENDENCIES
 # ============================================================
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     """
-    FastAPI dependency.
+    FastAPI dependency — validates JWT and returns user payload.
     Usage: current_user = Depends(get_current_user)
-    Returns the full decoded token payload.
     """
     payload = decode_token(token)
 
@@ -165,15 +162,18 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
 
 def require_role(allowed_roles: list):
     """
-    Role-based access dependency factory.
-    Usage: Depends(require_role(["admin", "security"]))
+    Role guard dependency factory.
+    Usage: current_user = Depends(require_role(["admin", "security"]))
     """
     def role_checker(current_user: dict = Depends(get_current_user)) -> dict:
         if current_user["role"] not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied. Required roles: {allowed_roles}. "
-                       f"Your role: {current_user['role']}"
+                detail=(
+                    f"Access denied. "
+                    f"Required: {allowed_roles}. "
+                    f"Your role: {current_user['role']}"
+                )
             )
         return current_user
     return role_checker

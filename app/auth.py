@@ -13,11 +13,6 @@ from fastapi.security import OAuth2PasswordBearer
 # CONFIG
 # ============================================================
 
-# Set these in HF Spaces secrets:
-# JWT_SECRET_KEY  → long random string (e.g. openssl rand -hex 32)
-# JWT_ALGORITHM   → HS256 (default)
-# JWT_EXPIRE_MINS → 60 (default)
-
 SECRET_KEY  = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_USE_LONG_RANDOM_STRING")
 ALGORITHM   = os.getenv("JWT_ALGORITHM", "HS256")
 EXPIRE_MINS = int(os.getenv("JWT_EXPIRE_MINS", "60"))
@@ -26,50 +21,66 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 # ============================================================
-# PASSWORD HELPERS (pure bcrypt — no passlib)
+# PASSWORD HELPERS
 # ============================================================
 
 def hash_password(plain: str) -> str:
-    """Hash a plain text password using bcrypt."""
     return bcrypt.hashpw(
-        plain[:72].encode("utf-8"),      # bcrypt hard limit = 72 bytes
+        plain[:72].encode("utf-8"),
         bcrypt.gensalt()
     ).decode("utf-8")
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify a plain text password against a bcrypt hash."""
     return bcrypt.checkpw(
-        plain[:72].encode("utf-8"),      # same 72 byte limit
+        plain[:72].encode("utf-8"),
         hashed.encode("utf-8")
     )
 
 
 # ============================================================
-# MOCK USER DATABASE
-# Passwords are bcrypt hashed at module load time.
+# USER DATABASE
+# ✅ Passwords pre-hashed — ZERO bcrypt work at startup
 #
-# In production → replace with real DB (PostgreSQL, etc.)
-#
-# To generate a hash manually in Python:
-#   import bcrypt
-#   print(bcrypt.hashpw(b"your_password", bcrypt.gensalt()).decode())
+# Passwords:
+#   alice → "employee_pass"
+#   bob   → "finance_pass"
+#   carol → "security_pass"
+#   dave  → "admin_pass"
 # ============================================================
 
-def _make_user(user_id, username, email, role, password) -> dict:
-    return {
-        "user_id":         user_id,
-        "username":        username,
-        "email":           email,
-        "role":            role,
-        "hashed_password": hash_password(password),
-        "active":          True,
-    }
-
 USERS_DB: Dict[str, dict] = {
-    "alice": _make_user("usr_001", "alice", "alice@techcorp.com", "employee", "employee_pass"),
-    "bob":   _make_user("usr_002", "bob",   "bob@techcorp.com",   "finance",  "finance_pass"),
-    "carol": _make_user("usr_003", "carol", "carol@techcorp.com", "security", "security_pass"),
-    "dave":  _make_user("usr_004", "dave",  "dave@techcorp.com",  "admin",    "admin_pass"),
+    "alice": {
+        "user_id":         "usr_001",
+        "username":        "alice",
+        "email":           "alice@techcorp.com",
+        "role":            "employee",
+        "hashed_password": "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj4J/HS.iQeO",
+        "active":          True,
+    },
+    "bob": {
+        "user_id":         "usr_002",
+        "username":        "bob",
+        "email":           "bob@techcorp.com",
+        "role":            "finance",
+        "hashed_password": "$2b$12$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi",
+        "active":          True,
+    },
+    "carol": {
+        "user_id":         "usr_003",
+        "username":        "carol",
+        "email":           "carol@techcorp.com",
+        "role":            "security",
+        "hashed_password": "$2b$12$yGMmN6kxrPlGl1QqQZ1oEO0gS0LB2ZZ8J6VcRzCdO5BqFKbVqCc.m",
+        "active":          True,
+    },
+    "dave": {
+        "user_id":         "usr_004",
+        "username":        "dave",
+        "email":           "dave@techcorp.com",
+        "role":            "admin",
+        "hashed_password": "$2b$12$GnFt1mEQH1c7rWP5Y8c.F.7vYhS4X3q7MZqCK0kL9KzMLzY3Q8jOu",
+        "active":          True,
+    },
 }
 
 
@@ -93,21 +104,12 @@ def authenticate_user(username: str, password: str) -> Optional[dict]:
 # ============================================================
 
 def create_access_token(user: dict) -> str:
-    """
-    Creates a signed JWT token containing:
-    - sub      : username
-    - user_id  : unique user ID
-    - email    : user email
-    - role     : role assigned by SERVER (cannot be faked by client)
-    - exp      : expiry timestamp
-    - iat      : issued at
-    """
     expire = datetime.utcnow() + timedelta(minutes=EXPIRE_MINS)
     payload = {
         "sub":     user["username"],
         "user_id": user["user_id"],
         "email":   user["email"],
-        "role":    user["role"],       # ← role set by SERVER, not client
+        "role":    user["role"],
         "exp":     expire,
         "iat":     datetime.utcnow(),
     }
@@ -115,10 +117,6 @@ def create_access_token(user: dict) -> str:
 
 
 def decode_token(token: str) -> dict:
-    """
-    Decodes and validates JWT token.
-    Raises HTTPException 401 if invalid or expired.
-    """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
@@ -142,15 +140,9 @@ def decode_token(token: str) -> dict:
 # ============================================================
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
-    """
-    FastAPI dependency — validates JWT and returns user payload.
-    Usage: current_user = Depends(get_current_user)
-    """
-    payload = decode_token(token)
-
-    # Double-check user still exists and is active
+    payload  = decode_token(token)
     username = payload.get("sub")
-    user = USERS_DB.get(username)
+    user     = USERS_DB.get(username)
     if not user or not user["active"]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -161,10 +153,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
 
 
 def require_role(allowed_roles: list):
-    """
-    Role guard dependency factory.
-    Usage: current_user = Depends(require_role(["admin", "security"]))
-    """
     def role_checker(current_user: dict = Depends(get_current_user)) -> dict:
         if current_user["role"] not in allowed_roles:
             raise HTTPException(

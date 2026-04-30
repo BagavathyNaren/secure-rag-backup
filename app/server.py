@@ -25,6 +25,8 @@ from app.secure_rag import (
     _llm,
     model_guard_check,
     compute_confidence,
+    scan_context_for_credentials,       
+    scan_answer_for_sensitive_terms,    
     log_event,
     audit,
     new_trace_id,
@@ -164,12 +166,20 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
         async def stream_tokens():
             full_answer = ""
 
+            try:
+                 scan_context_for_credentials(context, trace_id)
+            except ValueError as ve:
+                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
+                 return
+
             async for chunk in rag_chain.astream(user_input):
                 full_answer += chunk
                 yield f"data: {json.dumps({'token': chunk})}\n\n"
 
             # Output Guardrails
             try:
+                full_answer = pre_filter_check(full_answer, trace_id)
+                full_answer = scan_answer_for_sensitive_terms(full_answer, trace_id)  
                 full_answer = model_guard_check(full_answer, context, trace_id)
                 confidence = compute_confidence(retrieved_docs, full_answer)
 

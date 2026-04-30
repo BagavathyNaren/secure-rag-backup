@@ -25,8 +25,9 @@ from app.secure_rag import (
     _llm,
     model_guard_check,
     compute_confidence,
-    scan_context_for_credentials,       
-    scan_answer_for_sensitive_terms,    
+    scan_context_for_credentials,
+    scan_answer_for_sensitive_terms,
+    pre_filter_check,
     log_event,
     audit,
     new_trace_id,
@@ -114,11 +115,6 @@ class EvalRequest(BaseModel):
 EVAL_API_KEY = os.getenv("EVAL_API_KEY", "")
 
 def _require_eval_key(x_eval_key: Optional[str]):
-    """
-    Protects the eval endpoint.
-    Set EVAL_API_KEY in HF Spaces secrets.
-    Pass it as header: x-eval-key: <your-key>
-    """
     if not EVAL_API_KEY:
         raise HTTPException(
             status_code=403,
@@ -166,11 +162,16 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
         async def stream_tokens():
             full_answer = ""
 
+            # Scan context BEFORE streaming
             try:
-                 scan_context_for_credentials(context, trace_id)
+                scan_context_for_credentials(context, trace_id)
             except ValueError as ve:
-                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
-                 return
+                audit.log("REQUEST_FAILED", trace_id, {
+                    "error": str(ve),
+                    "stage": "context_scan"
+                })
+                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
+                return
 
             async for chunk in rag_chain.astream(user_input):
                 full_answer += chunk
@@ -179,7 +180,7 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
             # Output Guardrails
             try:
                 full_answer = pre_filter_check(full_answer, trace_id)
-                full_answer = scan_answer_for_sensitive_terms(full_answer, trace_id)  
+                full_answer = scan_answer_for_sensitive_terms(full_answer, trace_id)
                 full_answer = model_guard_check(full_answer, context, trace_id)
                 confidence = compute_confidence(retrieved_docs, full_answer)
 
@@ -228,14 +229,10 @@ async def secure_rag_eval(
     body: EvalRequest,
     x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
 ):
-    # Auth check
     _require_eval_key(x_eval_key)
 
     batch_id = new_trace_id()
-
-    audit.log("EVAL_BATCH_START", batch_id, {
-        "total_cases": len(body.cases)
-    })
+    audit.log("EVAL_BATCH_START", batch_id, {"total_cases": len(body.cases)})
 
     results = []
     passed = 0
@@ -252,7 +249,6 @@ async def secure_rag_eval(
             "should_block": case.should_block
         })
 
-        # State for this case
         answer = None
         confidence = None
         retrieved_sources = []
@@ -270,6 +266,9 @@ async def secure_rag_eval(
             retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
             context = "\n\n".join(d.page_content for d in retrieved_docs)
 
+            # ✅ Step 2b: Scan context BEFORE generation (THIS WAS MISSING)
+            scan_context_for_credentials(context, case_trace_id)
+
             # Step 3: Generation (non-streaming for eval)
             setup = RunnableParallel(
                 context=lambda _: context,
@@ -278,7 +277,9 @@ async def secure_rag_eval(
             rag_chain = setup | secure_prompt | _llm | StrOutputParser()
             answer = await rag_chain.ainvoke(clean_input)
 
-            # Step 4: Output guard
+            # Step 4: Output guards (same stack as streaming endpoint)
+            answer = pre_filter_check(answer, case_trace_id)
+            answer = scan_answer_for_sensitive_terms(answer, case_trace_id)  # ✅ WAS MISSING
             answer = model_guard_check(answer, context, case_trace_id)
             confidence = compute_confidence(retrieved_docs, answer)
 
@@ -287,21 +288,15 @@ async def secure_rag_eval(
             error_msg = str(e)
             confidence = "BLOCKED"
 
-        # ============================================================
-        # ASSERTIONS — check against expectations
-        # ============================================================
+        # Assertions
         checks = {}
-
-        # 1. Was it blocked as expected?
         checks["block_check"] = (blocked == case.should_block)
 
-        # 2. Confidence matches expectation?
         if case.expect_confidence:
             checks["confidence_check"] = (confidence == case.expect_confidence)
         else:
-            checks["confidence_check"] = True     # no expectation = auto pass
+            checks["confidence_check"] = True
 
-        # 3. Answer contains expected substrings?
         if case.expect_answer_contains and answer:
             answer_lower = answer.lower()
             checks["answer_content_check"] = all(
@@ -309,21 +304,18 @@ async def secure_rag_eval(
                 for keyword in case.expect_answer_contains
             )
         elif case.expect_answer_contains and not answer:
-            checks["answer_content_check"] = False  # expected answer but got none
+            checks["answer_content_check"] = False
         else:
-            checks["answer_content_check"] = True   # no expectation = auto pass
+            checks["answer_content_check"] = True
 
-        # 4. Expected sources were retrieved?
         if case.expect_sources_contains:
             source_set = set(retrieved_sources)
             checks["sources_check"] = all(
-                s in source_set
-                for s in case.expect_sources_contains
+                s in source_set for s in case.expect_sources_contains
             )
         else:
-            checks["sources_check"] = True          # no expectation = auto pass
+            checks["sources_check"] = True
 
-        # Overall pass/fail for this case
         case_passed = all(checks.values())
         if case_passed:
             passed += 1
@@ -339,7 +331,6 @@ async def secure_rag_eval(
             "error": error_msg
         })
 
-        # Build result payload
         result = {
             "case_id": case_id,
             "trace_id": case_trace_id,
@@ -360,7 +351,6 @@ async def secure_rag_eval(
 
         results.append(result)
 
-    # Final summary
     total = len(body.cases)
     failed = total - passed
     pass_rate = round((passed / total) * 100, 1) if total > 0 else 0.0
@@ -411,7 +401,6 @@ async def health_check():
         "components": {}
     }
 
-    # FAISS check
     try:
         if _vectorstore is not None:
             _ = _vectorstore.similarity_search("test", k=1)
@@ -423,7 +412,6 @@ async def health_check():
         health_status["components"]["faiss"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
-    # Embeddings check
     try:
         _embeddings.embed_query("health check")
         health_status["components"]["embeddings"] = "healthy"
@@ -431,7 +419,6 @@ async def health_check():
         health_status["components"]["embeddings"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
-    # LLM check
     try:
         _llm.invoke("ping")
         health_status["components"]["llm"] = "healthy"

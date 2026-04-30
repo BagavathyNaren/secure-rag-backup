@@ -35,4 +35,4 @@ langchain-core
 huggingface_hub
 python-jose[cryptography]
 bcrypt==4.0.1
-python-multipart
+python-multipar

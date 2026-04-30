@@ -1,6 +1,7 @@
 # app/server.py
 
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -17,6 +18,14 @@ import os
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+from app.auth import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    require_role,
+    EXPIRE_MINS
+)
+
 from app.secure_rag import (
     detect_prompt_injection,
     redact_pii,
@@ -31,6 +40,7 @@ from app.secure_rag import (
     log_event,
     audit,
     new_trace_id,
+    llm_cache,
     _vectorstore,
     _embeddings
 )
@@ -44,8 +54,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Tech Secure RAG API",
-    description="Enterprise-secured RAG with guardrails + RBAC",
-    version="2.0.0"
+    description="Enterprise-secured RAG with JWT auth + RBAC + guardrails",
+    version="3.0.0"
 )
 
 
@@ -65,12 +75,23 @@ app.add_middleware(SlowAPIMiddleware)
 
 class SecureRAGRequest(BaseModel):
     question: str
-    role: str = "employee"
+    # ✅ role is REMOVED from request body
+    # Role now comes from the JWT token — client cannot fake it
 
 
 class SecureRAGResponse(BaseModel):
     answer: str
     confidence: str
+    cached: bool = False
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    expires_in_minutes: int
+    user_id: str
+    email: str
+    role: str
 
 
 # ============================================================
@@ -82,30 +103,15 @@ class EvalCase(BaseModel):
     question: str
     role: str = "employee"
     should_block: bool = False
-    expect_confidence: Optional[str] = Field(
-        default=None,
-        description="Expected confidence level: HIGH, LOW, or BLOCKED"
-    )
-    expect_answer_contains: List[str] = Field(
-        default_factory=list,
-        description="List of substrings expected in the answer"
-    )
-    expect_sources_contains: List[str] = Field(
-        default_factory=list,
-        description="List of source filenames expected to be retrieved"
-    )
+    expect_confidence: Optional[str] = Field(default=None)
+    expect_answer_contains: List[str] = Field(default_factory=list)
+    expect_sources_contains: List[str] = Field(default_factory=list)
 
 
 class EvalRequest(BaseModel):
     cases: List[EvalCase]
-    include_answer: bool = Field(
-        default=False,
-        description="Include full answer text in response"
-    )
-    include_sources: bool = Field(
-        default=True,
-        description="Include retrieved source filenames in response"
-    )
+    include_answer: bool = Field(default=False)
+    include_sources: bool = Field(default=True)
 
 
 # ============================================================
@@ -118,7 +124,7 @@ def _require_eval_key(x_eval_key: Optional[str]):
     if not EVAL_API_KEY:
         raise HTTPException(
             status_code=403,
-            detail="Evaluation endpoint is disabled. Set EVAL_API_KEY secret to enable it."
+            detail="Evaluation endpoint is disabled. Set EVAL_API_KEY secret."
         )
     if not x_eval_key or x_eval_key != EVAL_API_KEY:
         raise HTTPException(
@@ -128,17 +134,91 @@ def _require_eval_key(x_eval_key: Optional[str]):
 
 
 # ============================================================
-# 4️⃣ SECURE RAG ENDPOINT (STREAMING)
+# 4️⃣ AUTH ENDPOINT — LOGIN
 # ============================================================
 
-@app.post("/secure-rag/invoke")
+@app.post("/auth/login", response_model=LoginResponse, tags=["Authentication"])
 @limiter.limit("10/minute")
-async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
+async def login(
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends()
+):
+    """
+    Login with username + password.
+    Returns a JWT token valid for EXPIRE_MINS minutes.
+    Use the token as: Authorization: Bearer <token>
+    """
+    user = authenticate_user(form_data.username, form_data.password)
 
+    if not user:
+        audit.log("LOGIN_FAILED", "auth", {
+            "username": form_data.username,
+            "reason": "invalid_credentials"
+        })
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token(user)
+
+    audit.log("LOGIN_SUCCESS", "auth", {
+        "user_id": user["user_id"],
+        "username": user["username"],
+        "email": user["email"],
+        "role": user["role"]
+    })
+
+    return LoginResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in_minutes=EXPIRE_MINS,
+        user_id=user["user_id"],
+        email=user["email"],
+        role=user["role"]
+    )
+
+
+# ============================================================
+# 5️⃣ WHOAMI — CHECK YOUR TOKEN
+# ============================================================
+
+@app.get("/auth/me", tags=["Authentication"])
+async def whoami(current_user: dict = Depends(get_current_user)):
+    """
+    Returns the current authenticated user's info from JWT token.
+    """
+    return {
+        "user_id": current_user["user_id"],
+        "email":   current_user["email"],
+        "role":    current_user["role"],
+        "sub":     current_user["sub"]
+    }
+
+
+# ============================================================
+# 6️⃣ SECURE RAG ENDPOINT (JWT PROTECTED + STREAMING)
+# ============================================================
+
+@app.post("/secure-rag/invoke", tags=["RAG"])
+@limiter.limit("10/minute")
+async def secure_rag_endpoint(
+    request: Request,
+    body: SecureRAGRequest,
+    current_user: dict = Depends(get_current_user)    # ← JWT required
+):
     trace_id = new_trace_id()
 
+    # Role comes from JWT token — NOT from request body
+    user_role  = current_user["role"]
+    user_id    = current_user["user_id"]
+    user_email = current_user["email"]
+
     audit.log("REQUEST_START", trace_id, {
-        "role": body.role,
+        "user_id":        user_id,
+        "email":          user_email,
+        "role":           user_role,
         "question_preview": body.question[:120]
     })
 
@@ -147,8 +227,29 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
         detect_prompt_injection(body.question, trace_id)
         user_input = redact_pii(body.question, trace_id)
 
+        # ✅ Check cache BEFORE retrieval
+        cached = llm_cache.get(user_role, user_input)
+        if cached:
+            audit.log("CACHE_HIT", trace_id, {
+                "user_id":    user_id,
+                "role":       user_role,
+                "confidence": cached["confidence"]
+            })
+            async def stream_cached():
+                # Stream cached answer token by token
+                for word in cached["answer"].split(" "):
+                    yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'answer': cached['answer'], 'confidence': cached['confidence'], 'cached': True})}\n\n"
+
+            return StreamingResponse(stream_cached(), media_type="text/event-stream")
+
+        audit.log("CACHE_MISS", trace_id, {
+            "user_id": user_id,
+            "role":    user_role
+        })
+
         # Secure Retrieval
-        retriever = build_secure_retriever(body.role, trace_id)
+        retriever = build_secure_retriever(user_role, trace_id)
         retrieved_docs = retriever(user_input)
         context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
@@ -167,6 +268,7 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
                 scan_context_for_credentials(context, trace_id)
             except ValueError as ve:
                 audit.log("REQUEST_FAILED", trace_id, {
+                    "user_id": user_id,
                     "error": str(ve),
                     "stage": "context_scan"
                 })
@@ -182,21 +284,31 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
                 full_answer = pre_filter_check(full_answer, trace_id)
                 full_answer = scan_answer_for_sensitive_terms(full_answer, trace_id)
                 full_answer = model_guard_check(full_answer, context, trace_id)
-                confidence = compute_confidence(retrieved_docs, full_answer)
+                confidence  = compute_confidence(retrieved_docs, full_answer)
 
-                audit.log("ANSWER", trace_id, {
-                    "message": full_answer[:500],
-                    "confidence": confidence,
-                    "role": body.role,
-                    "sources": [d.metadata.get("file_name") for d in retrieved_docs]
+                # ✅ Store in cache ONLY after passing all guards
+                llm_cache.set(user_role, user_input, {
+                    "answer": full_answer,
+                    "confidence": confidence
                 })
 
-                yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence})}\n\n"
+                audit.log("ANSWER", trace_id, {
+                    "user_id":    user_id,
+                    "email":      user_email,
+                    "role":       user_role,
+                    "message":    full_answer[:500],
+                    "confidence": confidence,
+                    "cached":     False,
+                    "sources":    [d.metadata.get("file_name") for d in retrieved_docs]
+                })
+
+                yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence, 'cached': False})}\n\n"
 
             except ValueError as ve:
                 audit.log("REQUEST_FAILED", trace_id, {
-                    "error": str(ve),
-                    "stage": "output_guard"
+                    "user_id": user_id,
+                    "error":   str(ve),
+                    "stage":   "output_guard"
                 })
                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
 
@@ -204,25 +316,27 @@ async def secure_rag_endpoint(request: Request, body: SecureRAGRequest):
 
     except ValueError as ve:
         audit.log("REQUEST_FAILED", trace_id, {
-            "error": str(ve),
-            "stage": "input_guard"
+            "user_id": user_id,
+            "error":   str(ve),
+            "stage":   "input_guard"
         })
         raise HTTPException(status_code=400, detail=str(ve))
 
     except Exception as e:
         audit.log("REQUEST_FAILED", trace_id, {
-            "error": str(e),
-            "stage": "unhandled"
+            "user_id": user_id,
+            "error":   str(e),
+            "stage":   "unhandled"
         })
         logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 # ============================================================
-# 4b️⃣ EVALUATION ENDPOINT (INTERNAL TESTING)
+# 7️⃣ EVALUATION ENDPOINT (INTERNAL — EVAL KEY PROTECTED)
 # ============================================================
 
-@app.post("/secure-rag/eval")
+@app.post("/secure-rag/eval", tags=["Internal"])
 @limiter.limit("5/minute")
 async def secure_rag_eval(
     request: Request,
@@ -235,60 +349,51 @@ async def secure_rag_eval(
     audit.log("EVAL_BATCH_START", batch_id, {"total_cases": len(body.cases)})
 
     results = []
-    passed = 0
+    passed  = 0
 
     for i, case in enumerate(body.cases):
         case_trace_id = new_trace_id()
         case_id = case.id or f"case_{i + 1}"
 
         audit.log("EVAL_CASE_START", case_trace_id, {
-            "batch_id": batch_id,
-            "case_id": case_id,
-            "role": case.role,
+            "batch_id":        batch_id,
+            "case_id":         case_id,
+            "role":            case.role,
             "question_preview": case.question[:120],
-            "should_block": case.should_block
+            "should_block":    case.should_block
         })
 
-        answer = None
-        confidence = None
+        answer           = None
+        confidence       = None
         retrieved_sources = []
-        blocked = False
-        error_msg = None
+        blocked          = False
+        error_msg        = None
 
         try:
-            # Step 1: Input guardrails
             detect_prompt_injection(case.question, case_trace_id)
             clean_input = redact_pii(case.question, case_trace_id)
 
-            # Step 2: Retrieval
             retriever = build_secure_retriever(case.role, case_trace_id)
-            retrieved_docs = retriever(clean_input)
+            retrieved_docs   = retriever(clean_input)
             retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
             context = "\n\n".join(d.page_content for d in retrieved_docs)
 
-            # ✅ Step 2b: Scan context BEFORE generation (THIS WAS MISSING)
             scan_context_for_credentials(context, case_trace_id)
 
-            # Step 3: Generation (non-streaming for eval)
-            setup = RunnableParallel(
-                context=lambda _: context,
-                question=RunnablePassthrough()
-            )
+            setup     = RunnableParallel(context=lambda _: context, question=RunnablePassthrough())
             rag_chain = setup | secure_prompt | _llm | StrOutputParser()
-            answer = await rag_chain.ainvoke(clean_input)
+            answer    = await rag_chain.ainvoke(clean_input)
 
-            # Step 4: Output guards (same stack as streaming endpoint)
-            answer = pre_filter_check(answer, case_trace_id)
-            answer = scan_answer_for_sensitive_terms(answer, case_trace_id)  # ✅ WAS MISSING
-            answer = model_guard_check(answer, context, case_trace_id)
+            answer     = pre_filter_check(answer, case_trace_id)
+            answer     = scan_answer_for_sensitive_terms(answer, case_trace_id)
+            answer     = model_guard_check(answer, context, case_trace_id)
             confidence = compute_confidence(retrieved_docs, answer)
 
         except Exception as e:
-            blocked = True
+            blocked   = True
             error_msg = str(e)
             confidence = "BLOCKED"
 
-        # Assertions
         checks = {}
         checks["block_check"] = (blocked == case.should_block)
 
@@ -300,8 +405,7 @@ async def secure_rag_eval(
         if case.expect_answer_contains and answer:
             answer_lower = answer.lower()
             checks["answer_content_check"] = all(
-                keyword.lower() in answer_lower
-                for keyword in case.expect_answer_contains
+                kw.lower() in answer_lower for kw in case.expect_answer_contains
             )
         elif case.expect_answer_contains and not answer:
             checks["answer_content_check"] = False
@@ -309,10 +413,8 @@ async def secure_rag_eval(
             checks["answer_content_check"] = True
 
         if case.expect_sources_contains:
-            source_set = set(retrieved_sources)
-            checks["sources_check"] = all(
-                s in source_set for s in case.expect_sources_contains
-            )
+            src_set = set(retrieved_sources)
+            checks["sources_check"] = all(s in src_set for s in case.expect_sources_contains)
         else:
             checks["sources_check"] = True
 
@@ -321,83 +423,104 @@ async def secure_rag_eval(
             passed += 1
 
         audit.log("EVAL_CASE_RESULT", case_trace_id, {
-            "batch_id": batch_id,
-            "case_id": case_id,
-            "passed": case_passed,
-            "blocked": blocked,
+            "batch_id":   batch_id,
+            "case_id":    case_id,
+            "passed":     case_passed,
+            "blocked":    blocked,
             "confidence": confidence,
-            "checks": checks,
-            "sources": retrieved_sources,
-            "error": error_msg
+            "checks":     checks,
+            "sources":    retrieved_sources,
+            "error":      error_msg
         })
 
         result = {
-            "case_id": case_id,
-            "trace_id": case_trace_id,
-            "role": case.role,
-            "question": case.question,
-            "passed": case_passed,
-            "blocked": blocked,
+            "case_id":    case_id,
+            "trace_id":   case_trace_id,
+            "role":       case.role,
+            "question":   case.question,
+            "passed":     case_passed,
+            "blocked":    blocked,
             "confidence": confidence,
-            "checks": checks,
-            "error": error_msg
+            "checks":     checks,
+            "error":      error_msg
         }
 
         if body.include_sources:
             result["sources"] = retrieved_sources
-
         if body.include_answer:
             result["answer"] = answer
 
         results.append(result)
 
-    total = len(body.cases)
-    failed = total - passed
+    total    = len(body.cases)
+    failed   = total - passed
     pass_rate = round((passed / total) * 100, 1) if total > 0 else 0.0
 
     summary = {
-        "batch_id": batch_id,
-        "total": total,
-        "passed": passed,
-        "failed": failed,
+        "batch_id":      batch_id,
+        "total":         total,
+        "passed":        passed,
+        "failed":        failed,
         "pass_rate_pct": pass_rate,
-        "results": results
+        "results":       results
     }
 
     audit.log("EVAL_BATCH_DONE", batch_id, {
-        "total": total,
-        "passed": passed,
-        "failed": failed,
-        "pass_rate_pct": pass_rate
+        "total": total, "passed": passed,
+        "failed": failed, "pass_rate_pct": pass_rate
     })
 
     return summary
 
 
 # ============================================================
-# 5️⃣ HEALTH CHECK
+# 8️⃣ CACHE STATS
 # ============================================================
 
-@app.get("/")
+@app.get("/secure-rag/cache/stats", tags=["Internal"])
+async def cache_stats(
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")
+):
+    _require_eval_key(x_eval_key)
+    stats = llm_cache.stats()
+    audit.log("CACHE_STATS_REQUESTED", "system", stats)
+    return stats
+
+
+# ============================================================
+# 9️⃣ CACHE CLEAR
+# ============================================================
+
+@app.delete("/secure-rag/cache/clear", tags=["Internal"])
+async def cache_clear(
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")
+):
+    _require_eval_key(x_eval_key)
+    cleared = llm_cache.clear()
+    audit.log("CACHE_CLEARED", "system", {"entries_removed": cleared})
+    return {"status": "cleared", "entries_removed": cleared}
+
+
+# ============================================================
+# 🔟 HEALTH CHECKS
+# ============================================================
+
+@app.get("/", tags=["Health"])
 def health():
     return {
-        "status": "ok",
-        "service": "Tech Secure RAG",
-        "version": "2.0.0",
+        "status":   "ok",
+        "service":  "Tech Secure RAG",
+        "version":  "3.0.0",
         "endpoint": "/secure-rag/invoke"
     }
 
 
-# ============================================================
-# 6️⃣ DETAILED HEALTH CHECK
-# ============================================================
-
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 async def health_check():
     health_status = {
-        "status": "ok",
-        "service": "Tech Secure RAG",
-        "version": "2.0.0",
+        "status":     "ok",
+        "service":    "Tech Secure RAG",
+        "version":    "3.0.0",
         "components": {}
     }
 
@@ -431,10 +554,6 @@ async def health_check():
 
     return health_status
 
-
-# ============================================================
-# RUN (local dev)
-# ============================================================
 
 if __name__ == "__main__":
     import uvicorn

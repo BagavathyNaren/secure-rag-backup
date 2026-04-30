@@ -275,7 +275,10 @@ async def secure_rag_endpoint(
         retrieved_docs = retriever(user_input)
         context        = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-        setup     = RunnableParallel(context=lambda _: context, question=RunnablePassthrough())
+        retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
+        sources_str = ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
+
+        setup = RunnableParallel(context=lambda _: context, question=RunnablePassthrough(), role=lambda _: user_role, sources=lambda _: sources_str,)
         rag_chain = setup | secure_prompt | _llm | StrOutputParser()
 
         async def stream_tokens():
@@ -371,11 +374,14 @@ async def secure_rag_eval(
             retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
             context           = "\n\n".join(d.page_content for d in retrieved_docs)
 
+            retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
+            sources_str = ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
+
             scan_context_for_credentials(context, case_trace_id)
 
-            setup     = RunnableParallel(context=lambda _: context, question=RunnablePassthrough())
+            setup = RunnableParallel(context=lambda _: context, question=RunnablePassthrough(), role=lambda _: case.role, sources=lambda _: sources_str,)
             rag_chain = setup | secure_prompt | _llm | StrOutputParser()
-            answer    = await rag_chain.ainvoke(clean_input)
+            answer = await rag_chain.ainvoke(clean_input)
 
             answer     = pre_filter_check(answer, case_trace_id)
             answer     = scan_answer_for_sensitive_terms(answer, case_trace_id)

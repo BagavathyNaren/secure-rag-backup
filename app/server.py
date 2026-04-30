@@ -226,31 +226,23 @@ else:
     "/secure-rag/invoke",
     tags=["RAG"],
     summary="Ask a question (JWT required)",
-    description=(
-        "Submit a question. Role is determined automatically from your JWT token.\n\n"
-        "**How to authenticate:**\n"
-        "1. POST to `/auth/login` with your username + password\n"
-        "2. Copy the `access_token` from the response\n"
-        "3. Add header: `Authorization: Bearer <token>`"
-    )
 )
 @limiter.limit("10/minute")
 async def secure_rag_endpoint(
     request: Request,
     body: SecureRAGRequest,
-    current_user: dict = Depends(get_current_user),  # ✅ PATCH: Swagger will attach token automatically
+    current_user: dict = Depends(get_current_user),
 ):
     trace_id = new_trace_id()
 
-    # ✅ PATCH: role comes from dependency (JWT), no manual header parsing
     user_role  = current_user["role"]
     user_id    = current_user["user_id"]
     user_email = current_user["email"]
 
     audit.log("REQUEST_START", trace_id, {
-        "user_id":          user_id,
-        "email":            user_email,
-        "role":             user_role,
+        "user_id": user_id,
+        "email": user_email,
+        "role": user_role,
         "question_preview": body.question[:120]
     })
 
@@ -258,26 +250,26 @@ async def secure_rag_endpoint(
         detect_prompt_injection(body.question, trace_id)
         user_input = redact_pii(body.question, trace_id)
 
-        # Check cache
         cached = llm_cache.get(user_role, user_input)
         if cached:
             audit.log("CACHE_HIT", trace_id, {
-                "user_id":    user_id,
-                "role":       user_role,
+                "user_id": user_id,
+                "role": user_role,
                 "confidence": cached["confidence"]
             })
 
             async def stream_cached():
+                # ✅ stream meta first
+                yield f"data: {json.dumps({'meta': True, 'trace_id': trace_id, 'cache': 'HIT', 'role': user_role})}\n\n"
+
                 for word in cached["answer"].split(" "):
                     yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-                yield f"data: {json.dumps({'done': True, 'answer': cached['answer'], 'confidence': cached['confidence'], 'cached': True})}\n\n"
+
+                yield f"data: {json.dumps({'done': True, 'trace_id': trace_id, 'answer': cached['answer'], 'confidence': cached['confidence'], 'cached': True})}\n\n"
 
             return StreamingResponse(stream_cached(), media_type="text/event-stream")
 
-        audit.log("CACHE_MISS", trace_id, {
-            "user_id": user_id,
-            "role":    user_role
-        })
+        audit.log("CACHE_MISS", trace_id, {"user_id": user_id, "role": user_role})
 
         retriever      = build_secure_retriever(user_role, trace_id)
         retrieved_docs = retriever(user_input)
@@ -287,17 +279,16 @@ async def secure_rag_endpoint(
         rag_chain = setup | secure_prompt | _llm | StrOutputParser()
 
         async def stream_tokens():
+            # ✅ stream meta first
+            yield f"data: {json.dumps({'meta': True, 'trace_id': trace_id, 'cache': 'MISS', 'role': user_role})}\n\n"
+
             full_answer = ""
 
             try:
                 scan_context_for_credentials(context, trace_id)
             except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {
-                    "user_id": user_id,
-                    "error":   str(ve),
-                    "stage":   "context_scan"
-                })
-                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
+                audit.log("REQUEST_FAILED", trace_id, {"user_id": user_id, "error": str(ve), "stage": "context_scan"})
+                yield f"data: {json.dumps({'error': str(ve), 'trace_id': trace_id})}\n\n"
                 return
 
             async for chunk in rag_chain.astream(user_input):
@@ -310,50 +301,29 @@ async def secure_rag_endpoint(
                 full_answer = model_guard_check(full_answer, context, trace_id)
                 confidence  = compute_confidence(retrieved_docs, full_answer)
 
-                llm_cache.set(user_role, user_input, {
-                    "answer":     full_answer,
-                    "confidence": confidence
-                })
+                llm_cache.set(user_role, user_input, {"answer": full_answer, "confidence": confidence})
 
                 audit.log("ANSWER", trace_id, {
-                    "user_id":    user_id,
-                    "email":      user_email,
-                    "role":       user_role,
-                    "message":    full_answer[:500],
+                    "user_id": user_id,
+                    "email": user_email,
+                    "role": user_role,
+                    "message": full_answer[:500],
                     "confidence": confidence,
-                    "cached":     False,
-                    "sources":    [d.metadata.get("file_name") for d in retrieved_docs]
+                    "cached": False,
+                    "sources": [d.metadata.get("file_name") for d in retrieved_docs]
                 })
 
-                yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence, 'cached': False})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'trace_id': trace_id, 'answer': full_answer, 'confidence': confidence, 'cached': False})}\n\n"
 
             except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {
-                    "user_id": user_id,
-                    "error":   str(ve),
-                    "stage":   "output_guard"
-                })
-                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
+                audit.log("REQUEST_FAILED", trace_id, {"user_id": user_id, "error": str(ve), "stage": "output_guard"})
+                yield f"data: {json.dumps({'error': str(ve), 'trace_id': trace_id})}\n\n"
 
         return StreamingResponse(stream_tokens(), media_type="text/event-stream")
 
     except ValueError as ve:
-        audit.log("REQUEST_FAILED", trace_id, {
-            "user_id": user_id,
-            "error":   str(ve),
-            "stage":   "input_guard"
-        })
+        audit.log("REQUEST_FAILED", trace_id, {"user_id": user_id, "error": str(ve), "stage": "input_guard"})
         raise HTTPException(status_code=400, detail=str(ve))
-
-    except Exception as e:
-        audit.log("REQUEST_FAILED", trace_id, {
-            "user_id": user_id,
-            "error":   str(e),
-            "stage":   "unhandled"
-        })
-        logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-
 
 # ============================================================
 # 6️⃣ EVALUATION ENDPOINT

@@ -18,13 +18,13 @@ import os
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-# ── Wrap auth import so we see the REAL error if it fails ──
 try:
     from app.auth import (
         authenticate_user,
         create_access_token,
         get_current_user,
         require_role,
+        decode_token,
         EXPIRE_MINS
     )
     AUTH_AVAILABLE = True
@@ -55,6 +55,7 @@ from app.secure_rag import (
 
 logger = logging.getLogger(__name__)
 
+
 # ============================================================
 # 1️⃣ FASTAPI INIT
 # ============================================================
@@ -64,6 +65,7 @@ app = FastAPI(
     description="Enterprise-secured RAG with JWT auth + RBAC + guardrails",
     version="3.0.0"
 )
+
 
 # ============================================================
 # 2️⃣ RATE LIMITING
@@ -79,9 +81,16 @@ app.add_middleware(SlowAPIMiddleware)
 # 3️⃣ REQUEST MODELS
 # ============================================================
 
+# ✅ role REMOVED — it now comes exclusively from JWT token
 class SecureRAGRequest(BaseModel):
     question: str
-    role: str = "employee"    # Kept as fallback if auth unavailable
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "question": "What is the minimum password length?"
+            }
+        }
 
 
 class SecureRAGResponse(BaseModel):
@@ -139,7 +148,7 @@ def _require_eval_key(x_eval_key: Optional[str]):
 
 
 # ============================================================
-# 4️⃣ AUTH ENDPOINTS (only if auth loaded successfully)
+# 4️⃣ AUTH ENDPOINTS
 # ============================================================
 
 if AUTH_AVAILABLE:
@@ -150,11 +159,16 @@ if AUTH_AVAILABLE:
         request: Request,
         form_data: OAuth2PasswordRequestForm = Depends()
     ):
+        """
+        Login with username + password.
+        Returns JWT token valid for EXPIRE_MINS minutes.
+        Use token as: Authorization: Bearer <token>
+        """
         user = authenticate_user(form_data.username, form_data.password)
         if not user:
             audit.log("LOGIN_FAILED", "auth", {
                 "username": form_data.username,
-                "reason": "invalid_credentials"
+                "reason":   "invalid_credentials"
             })
             raise HTTPException(
                 status_code=401,
@@ -182,6 +196,7 @@ if AUTH_AVAILABLE:
 
     @app.get("/auth/me", tags=["Authentication"])
     async def whoami(current_user: dict = Depends(get_current_user)):
+        """Returns the current authenticated user info from JWT token."""
         return {
             "user_id": current_user["user_id"],
             "email":   current_user["email"],
@@ -190,7 +205,6 @@ if AUTH_AVAILABLE:
         }
 
 else:
-    # Auth failed to load — expose a clear error endpoint
     @app.get("/auth/status", tags=["Authentication"])
     async def auth_status():
         return {
@@ -200,10 +214,21 @@ else:
 
 
 # ============================================================
-# 5️⃣ SECURE RAG ENDPOINT (STREAMING)
+# 5️⃣ SECURE RAG ENDPOINT (JWT PROTECTED + STREAMING)
 # ============================================================
 
-@app.post("/secure-rag/invoke", tags=["RAG"])
+@app.post(
+    "/secure-rag/invoke",
+    tags=["RAG"],
+    summary="Ask a question (JWT required)",
+    description=(
+        "Submit a question. Role is determined automatically from your JWT token.\n\n"
+        "**How to authenticate:**\n"
+        "1. POST to `/auth/login` with your username + password\n"
+        "2. Copy the `access_token` from the response\n"
+        "3. Add header: `Authorization: Bearer <token>`"
+    )
+)
 @limiter.limit("10/minute")
 async def secure_rag_endpoint(
     request: Request,
@@ -211,21 +236,25 @@ async def secure_rag_endpoint(
 ):
     trace_id = new_trace_id()
 
-    # If JWT auth is available → use it, else fall back to body.role
+    # ✅ Role comes EXCLUSIVELY from JWT token — never from request body
     if AUTH_AVAILABLE:
-        from fastapi.security import OAuth2PasswordBearer
-        from app.auth import decode_token
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing Authorization header.")
-        token = auth_header.split(" ", 1)[1]
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Missing or invalid Authorization header. "
+                    "Please login at /auth/login to get your token, "
+                    "then add: Authorization: Bearer <token>"
+                )
+            )
+        token        = auth_header.split(" ", 1)[1]
         current_user = decode_token(token)
-        user_role  = current_user["role"]
-        user_id    = current_user["user_id"]
-        user_email = current_user["email"]
+        user_role    = current_user["role"]
+        user_id      = current_user["user_id"]
+        user_email   = current_user["email"]
     else:
-        # Fallback — no auth (dev mode only)
-        user_role  = body.role
+        user_role  = "employee"
         user_id    = "anonymous"
         user_email = "anonymous"
 
@@ -256,11 +285,14 @@ async def secure_rag_endpoint(
 
             return StreamingResponse(stream_cached(), media_type="text/event-stream")
 
-        audit.log("CACHE_MISS", trace_id, {"user_id": user_id, "role": user_role})
+        audit.log("CACHE_MISS", trace_id, {
+            "user_id": user_id,
+            "role":    user_role
+        })
 
-        retriever     = build_secure_retriever(user_role, trace_id)
+        retriever      = build_secure_retriever(user_role, trace_id)
         retrieved_docs = retriever(user_input)
-        context       = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        context        = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
         setup     = RunnableParallel(context=lambda _: context, question=RunnablePassthrough())
         rag_chain = setup | secure_prompt | _llm | StrOutputParser()
@@ -271,7 +303,11 @@ async def secure_rag_endpoint(
             try:
                 scan_context_for_credentials(context, trace_id)
             except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {"error": str(ve), "stage": "context_scan"})
+                audit.log("REQUEST_FAILED", trace_id, {
+                    "user_id": user_id,
+                    "error":   str(ve),
+                    "stage":   "context_scan"
+                })
                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
                 return
 
@@ -303,17 +339,29 @@ async def secure_rag_endpoint(
                 yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence, 'cached': False})}\n\n"
 
             except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {"error": str(ve), "stage": "output_guard"})
+                audit.log("REQUEST_FAILED", trace_id, {
+                    "user_id": user_id,
+                    "error":   str(ve),
+                    "stage":   "output_guard"
+                })
                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
 
         return StreamingResponse(stream_tokens(), media_type="text/event-stream")
 
     except ValueError as ve:
-        audit.log("REQUEST_FAILED", trace_id, {"error": str(ve), "stage": "input_guard"})
+        audit.log("REQUEST_FAILED", trace_id, {
+            "user_id": user_id,
+            "error":   str(ve),
+            "stage":   "input_guard"
+        })
         raise HTTPException(status_code=400, detail=str(ve))
 
     except Exception as e:
-        audit.log("REQUEST_FAILED", trace_id, {"error": str(e), "stage": "unhandled"})
+        audit.log("REQUEST_FAILED", trace_id, {
+            "user_id": user_id,
+            "error":   str(e),
+            "stage":   "unhandled"
+        })
         logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
@@ -342,25 +390,27 @@ async def secure_rag_eval(
         case_id       = case.id or f"case_{i + 1}"
 
         audit.log("EVAL_CASE_START", case_trace_id, {
-            "batch_id": batch_id, "case_id": case_id,
-            "role": case.role, "should_block": case.should_block,
+            "batch_id":        batch_id,
+            "case_id":         case_id,
+            "role":            case.role,
+            "should_block":    case.should_block,
             "question_preview": case.question[:120]
         })
 
-        answer = None
-        confidence = None
+        answer            = None
+        confidence        = None
         retrieved_sources = []
-        blocked   = False
-        error_msg = None
+        blocked           = False
+        error_msg         = None
 
         try:
             detect_prompt_injection(case.question, case_trace_id)
             clean_input = redact_pii(case.question, case_trace_id)
 
-            retriever      = build_secure_retriever(case.role, case_trace_id)
-            retrieved_docs = retriever(clean_input)
+            retriever         = build_secure_retriever(case.role, case_trace_id)
+            retrieved_docs    = retriever(clean_input)
             retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
-            context = "\n\n".join(d.page_content for d in retrieved_docs)
+            context           = "\n\n".join(d.page_content for d in retrieved_docs)
 
             scan_context_for_credentials(context, case_trace_id)
 
@@ -374,39 +424,53 @@ async def secure_rag_eval(
             confidence = compute_confidence(retrieved_docs, answer)
 
         except Exception as e:
-            blocked   = True
-            error_msg = str(e)
+            blocked    = True
+            error_msg  = str(e)
             confidence = "BLOCKED"
 
         checks = {}
-        checks["block_check"] = (blocked == case.should_block)
+        checks["block_check"]      = (blocked == case.should_block)
         checks["confidence_check"] = (confidence == case.expect_confidence) if case.expect_confidence else True
 
         if case.expect_answer_contains and answer:
-            checks["answer_content_check"] = all(kw.lower() in answer.lower() for kw in case.expect_answer_contains)
+            checks["answer_content_check"] = all(
+                kw.lower() in answer.lower() for kw in case.expect_answer_contains
+            )
         elif case.expect_answer_contains and not answer:
             checks["answer_content_check"] = False
         else:
             checks["answer_content_check"] = True
 
-        checks["sources_check"] = all(s in set(retrieved_sources) for s in case.expect_sources_contains) if case.expect_sources_contains else True
+        checks["sources_check"] = (
+            all(s in set(retrieved_sources) for s in case.expect_sources_contains)
+            if case.expect_sources_contains else True
+        )
 
         case_passed = all(checks.values())
         if case_passed:
             passed += 1
 
         audit.log("EVAL_CASE_RESULT", case_trace_id, {
-            "batch_id": batch_id, "case_id": case_id,
-            "passed": case_passed, "blocked": blocked,
-            "confidence": confidence, "checks": checks,
-            "sources": retrieved_sources, "error": error_msg
+            "batch_id":   batch_id,
+            "case_id":    case_id,
+            "passed":     case_passed,
+            "blocked":    blocked,
+            "confidence": confidence,
+            "checks":     checks,
+            "sources":    retrieved_sources,
+            "error":      error_msg
         })
 
         result = {
-            "case_id": case_id, "trace_id": case_trace_id,
-            "role": case.role, "question": case.question,
-            "passed": case_passed, "blocked": blocked,
-            "confidence": confidence, "checks": checks, "error": error_msg
+            "case_id":    case_id,
+            "trace_id":   case_trace_id,
+            "role":       case.role,
+            "question":   case.question,
+            "passed":     case_passed,
+            "blocked":    blocked,
+            "confidence": confidence,
+            "checks":     checks,
+            "error":      error_msg
         }
         if body.include_sources: result["sources"] = retrieved_sources
         if body.include_answer:  result["answer"]  = answer
@@ -415,14 +479,19 @@ async def secure_rag_eval(
     total     = len(body.cases)
     pass_rate = round((passed / total) * 100, 1) if total > 0 else 0.0
     summary   = {
-        "batch_id": batch_id, "total": total,
-        "passed": passed, "failed": total - passed,
-        "pass_rate_pct": pass_rate, "results": results
+        "batch_id":      batch_id,
+        "total":         total,
+        "passed":        passed,
+        "failed":        total - passed,
+        "pass_rate_pct": pass_rate,
+        "results":       results
     }
 
     audit.log("EVAL_BATCH_DONE", batch_id, {
-        "total": total, "passed": passed,
-        "failed": total - passed, "pass_rate_pct": pass_rate
+        "total":         total,
+        "passed":        passed,
+        "failed":        total - passed,
+        "pass_rate_pct": pass_rate
     })
     return summary
 
@@ -432,7 +501,9 @@ async def secure_rag_eval(
 # ============================================================
 
 @app.get("/secure-rag/cache/stats", tags=["Internal"])
-async def cache_stats(x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")):
+async def cache_stats(
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")
+):
     _require_eval_key(x_eval_key)
     stats = llm_cache.stats()
     audit.log("CACHE_STATS_REQUESTED", "system", stats)
@@ -440,7 +511,9 @@ async def cache_stats(x_eval_key: Optional[str] = Header(default=None, alias="x-
 
 
 @app.delete("/secure-rag/cache/clear", tags=["Internal"])
-async def cache_clear(x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")):
+async def cache_clear(
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")
+):
     _require_eval_key(x_eval_key)
     cleared = llm_cache.clear()
     audit.log("CACHE_CLEARED", "system", {"entries_removed": cleared})
@@ -465,8 +538,10 @@ def health():
 @app.get("/health", tags=["Health"])
 async def health_check():
     health_status = {
-        "status": "ok", "service": "Tech Secure RAG",
-        "version": "3.0.0", "components": {}
+        "status":     "ok",
+        "service":    "Tech Secure RAG",
+        "version":    "3.0.0",
+        "components": {}
     }
 
     try:

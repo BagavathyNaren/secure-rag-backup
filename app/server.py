@@ -1,560 +1,460 @@
-# app/server.py
+# app/secure_rag.py
 
-from fastapi import FastAPI, HTTPException, Request, Header, Depends
-from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, Field
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-from slowapi.extension import _rate_limit_exceeded_handler
-from fastapi.responses import StreamingResponse
-from typing import Optional, List
+import re
 import json
-import traceback
-import logging
-import os
+import uuid
+import hashlib
+import time
+from datetime import datetime
+from typing import Dict, Optional
 
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-
-from app.auth import (
-    authenticate_user,
-    create_access_token,
-    get_current_user,
-    require_role,
-    EXPIRE_MINS
-)
-
-from app.secure_rag import (
-    detect_prompt_injection,
-    redact_pii,
-    build_secure_retriever,
-    secure_prompt,
-    _llm,
-    model_guard_check,
-    compute_confidence,
-    scan_context_for_credentials,
-    scan_answer_for_sensitive_terms,
-    pre_filter_check,
-    log_event,
-    audit,
-    new_trace_id,
-    llm_cache,
-    _vectorstore,
-    _embeddings
-)
-
-logger = logging.getLogger(__name__)
+import os
+from app.config import *
+from app.ingestion import ingest_all
+from app.chunking import recursive_character_chunking
 
 
 # ============================================================
-# 1️⃣ FASTAPI INIT
+# AUDIT LOGGER — PER-REQUEST TRACE ID
 # ============================================================
 
-app = FastAPI(
-    title="Tech Secure RAG API",
-    description="Enterprise-secured RAG with JWT auth + RBAC + guardrails",
-    version="3.0.0"
-)
+class AuditLogger:
+    def log(self, event: str, trace_id: str = "system", data: dict = None):
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "trace_id": trace_id,
+            "event": event,
+            **(data or {})
+        }
+        print(json.dumps(entry), flush=True)
 
+audit = AuditLogger()
 
-# ============================================================
-# 2️⃣ RATE LIMITING
-# ============================================================
-
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)
-
-
-# ============================================================
-# 3️⃣ REQUEST MODELS
-# ============================================================
-
-class SecureRAGRequest(BaseModel):
-    question: str
-    # ✅ role is REMOVED from request body
-    # Role now comes from the JWT token — client cannot fake it
-
-
-class SecureRAGResponse(BaseModel):
-    answer: str
-    confidence: str
-    cached: bool = False
-
-
-class LoginResponse(BaseModel):
-    access_token: str
-    token_type: str
-    expires_in_minutes: int
-    user_id: str
-    email: str
-    role: str
+def new_trace_id() -> str:
+    return str(uuid.uuid4())
 
 
 # ============================================================
-# 3b️⃣ EVALUATION MODELS
+# BACKWARDS COMPATIBLE log_event
 # ============================================================
 
-class EvalCase(BaseModel):
-    id: Optional[str] = None
-    question: str
-    role: str = "employee"
-    should_block: bool = False
-    expect_confidence: Optional[str] = Field(default=None)
-    expect_answer_contains: List[str] = Field(default_factory=list)
-    expect_sources_contains: List[str] = Field(default_factory=list)
-
-
-class EvalRequest(BaseModel):
-    cases: List[EvalCase]
-    include_answer: bool = Field(default=False)
-    include_sources: bool = Field(default=True)
+def log_event(event_type: str, data):
+    if isinstance(data, str):
+        audit.log(event_type, data={"message": data})
+    elif isinstance(data, dict):
+        audit.log(event_type, data=data)
+    else:
+        audit.log(event_type, data={"data": str(data)})
 
 
 # ============================================================
-# EVAL AUTH GUARD
+# ✅ LLM ANSWER CACHE
 # ============================================================
 
-EVAL_API_KEY = os.getenv("EVAL_API_KEY", "")
-
-def _require_eval_key(x_eval_key: Optional[str]):
-    if not EVAL_API_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Evaluation endpoint is disabled. Set EVAL_API_KEY secret."
-        )
-    if not x_eval_key or x_eval_key != EVAL_API_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Forbidden: invalid or missing x-eval-key header."
-        )
-
-
-# ============================================================
-# 4️⃣ AUTH ENDPOINT — LOGIN
-# ============================================================
-
-@app.post("/auth/login", response_model=LoginResponse, tags=["Authentication"])
-@limiter.limit("10/minute")
-async def login(
-    request: Request,
-    form_data: OAuth2PasswordRequestForm = Depends()
-):
+class LLMCache:
     """
-    Login with username + password.
-    Returns a JWT token valid for EXPIRE_MINS minutes.
-    Use the token as: Authorization: Bearer <token>
-    """
-    user = authenticate_user(form_data.username, form_data.password)
+    Simple in-memory TTL cache for LLM answers.
 
-    if not user:
-        audit.log("LOGIN_FAILED", "auth", {
-            "username": form_data.username,
-            "reason": "invalid_credentials"
+    Key        : SHA256(role + "|" + normalized_question)
+    Value      : {"answer": str, "confidence": str, "expires_at": float}
+    TTL        : configurable in seconds (default 5 minutes)
+    Max entries: configurable (default 200) — FIFO eviction when full
+    """
+
+    def __init__(self, ttl_seconds: int = 300, max_entries: int = 200):
+        self._store: Dict[str, dict] = {}
+        self._ttl   = ttl_seconds
+        self._max   = max_entries
+
+    def _make_key(self, role: str, question: str) -> str:
+        normalized = question.strip().lower()
+        raw = f"{role}|{normalized}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def get(self, role: str, question: str) -> Optional[dict]:
+        key   = self._make_key(role, question)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() > entry["expires_at"]:
+            del self._store[key]   # expired — evict
+            return None
+        return entry["value"]
+
+    def set(self, role: str, question: str, value: dict) -> None:
+        # Evict oldest entry if at capacity (FIFO)
+        if len(self._store) >= self._max:
+            oldest_key = next(iter(self._store))
+            del self._store[oldest_key]
+
+        key = self._make_key(role, question)
+        self._store[key] = {
+            "value":      value,
+            "expires_at": time.monotonic() + self._ttl
+        }
+
+    def invalidate(self, role: str, question: str) -> None:
+        key = self._make_key(role, question)
+        self._store.pop(key, None)
+
+    def clear(self) -> int:
+        count = len(self._store)
+        self._store.clear()
+        return count
+
+    def stats(self) -> dict:
+        now     = time.monotonic()
+        active  = sum(1 for e in self._store.values() if e["expires_at"] > now)
+        expired = len(self._store) - active
+        return {
+            "total_entries":   len(self._store),
+            "active_entries":  active,
+            "expired_entries": expired,
+            "ttl_seconds":     self._ttl,
+            "max_entries":     self._max
+        }
+
+
+# Global cache instance — 5 min TTL, 200 max entries
+llm_cache = LLMCache(ttl_seconds=300, max_entries=200)
+
+audit.log("CACHE_INIT", "startup", {
+    "ttl_seconds": 300,
+    "max_entries": 200
+})
+
+
+# ============================================================
+# NUCLEAR BLOCKS
+# ============================================================
+
+DANGEROUS_PATTERNS = [
+    r"AKIA[0-9A-Z]{16}",
+    r"sk_[a-zA-Z0-9]{32,}",
+    r"claude-api-key",
+    r"-----BEGIN",
+    r"Secret Access Key",
+    r"ghp_",
+]
+
+def pre_filter_check(answer: str, trace_id: str = "system") -> str:
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            audit.log("SECURITY_BLOCK", trace_id, {
+                "trigger": "pre_filter",
+                "pattern": pattern
+            })
+            raise ValueError("SECURITY BLOCK: Credential detected.")
+    return answer
+
+
+# ============================================================
+# CONTEXT CREDENTIAL SCANNER
+# ============================================================
+
+SENSITIVE_CONTEXT_PATTERNS = [
+    r"AKIA[0-9A-Z]{16}",
+    r"claude-api-key-[a-zA-Z0-9\-]{10,}",
+    r"-----BEGIN\s+[A-Z ]+PRIVATE KEY-----",
+    r"ghp_[a-zA-Z0-9]{36}",
+    r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}",
+    r"(?i)access.{0,5}key.{0,5}id\s*[:=]\s*[A-Z0-9]{10,}",
+    r"sk_[a-zA-Z0-9]{32,}",
+]
+
+def scan_context_for_credentials(context: str, trace_id: str = "system") -> None:
+    for pattern in SENSITIVE_CONTEXT_PATTERNS:
+        if re.search(pattern, context, re.IGNORECASE):
+            audit.log("CONTEXT_CREDENTIAL_BLOCK", trace_id, {
+                "reason": "credentials_found_in_retrieved_context",
+                "pattern": pattern,
+                "action": "BLOCKED_BEFORE_GENERATION"
+            })
+            raise ValueError(
+                "SECURITY BLOCK: Retrieved context contains sensitive credentials. "
+                "Request blocked before LLM generation."
+            )
+
+
+# ============================================================
+# SENSITIVE ANSWER TERM SCANNER
+# ============================================================
+
+SENSITIVE_ANSWER_TERMS = [
+    r"(?i)(api\s*key|secret\s*key|access\s*key|private\s*key)",
+    r"(?i)(aws|s3).{0,20}(key|credential|secret|token)",
+    r"(?i)(fake|mock|test|simulated|non-functional).{0,40}(key|credential|secret|token)",
+    r"(?i)(credential|credentials).{0,30}(fake|mock|test|simulated|demo)",
+    r"(?i)claude.{0,10}api.{0,10}key",
+    r"(?i)(access\s*key\s*id|secret\s*access\s*key)",
+]
+
+def scan_answer_for_sensitive_terms(answer: str, trace_id: str = "system") -> str:
+    for pattern in SENSITIVE_ANSWER_TERMS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            audit.log("SECURITY_BLOCK", trace_id, {
+                "trigger": "sensitive_term_in_answer",
+                "pattern": pattern,
+                "action": "BLOCKED_AFTER_GENERATION"
+            })
+            raise ValueError(
+                "SECURITY BLOCK: Answer references sensitive credential terms."
+            )
+    return answer
+
+
+# ============================================================
+# INPUT GUARDRAILS
+# ============================================================
+
+INJECTION_PATTERNS = [
+    r"ignore previous",
+    r"disregard",
+    r"system prompt",
+    r"reveal confidential",
+]
+
+def detect_prompt_injection(user_input: str, trace_id: str = "system"):
+    if any(re.search(p, user_input, re.IGNORECASE) for p in INJECTION_PATTERNS):
+        audit.log("PROMPT_INJECTION_DETECTED", trace_id, {
+            "input_preview": user_input[:100],
+            "action": "BLOCKED"
         })
-        raise HTTPException(
-            status_code=401,
-            detail="Incorrect username or password.",
-            headers={"WWW-Authenticate": "Bearer"},
+        raise ValueError("Prompt injection detected.")
+
+def redact_pii(text: str, trace_id: str = "system") -> str:
+    original = text
+    text = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "[EMAIL]", text)
+    text = re.sub(r"\b(?:\d[ -]*?){13,16}\b", "[CARD]", text)
+    if text != original:
+        audit.log("PII_REDACTED", trace_id, {"note": "PII found and redacted"})
+    return text
+
+
+# ============================================================
+# VECTORSTORE & RETRIEVAL (WITH STARTUP LOGS)
+# ============================================================
+
+INDEX_PATH           = "faiss_index"
+EMBEDDING_MODEL_NAME = "text-embedding-3-small"
+_embeddings          = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+
+def _faiss_ntotal(vs) -> int:
+    try:
+        return int(vs.index.ntotal)
+    except Exception:
+        return -1
+
+_index_exists = os.path.exists(INDEX_PATH)
+
+audit.log("FAISS_INDEX_CHECK", "startup", {
+    "index_path":      INDEX_PATH,
+    "exists":          _index_exists,
+    "embedding_model": EMBEDDING_MODEL_NAME
+})
+
+if _index_exists:
+    audit.log("FAISS_INDEX_LOAD_START", "startup", {"index_path": INDEX_PATH})
+    try:
+        _vectorstore = FAISS.load_local(
+            INDEX_PATH,
+            _embeddings,
+            allow_dangerous_deserialization=True
         )
-
-    token = create_access_token(user)
-
-    audit.log("LOGIN_SUCCESS", "auth", {
-        "user_id": user["user_id"],
-        "username": user["username"],
-        "email": user["email"],
-        "role": user["role"]
+    except Exception as e:
+        audit.log("FAISS_INDEX_LOAD_FAILED", "startup", {"error": str(e)})
+        raise
+    audit.log("FAISS_INDEX_LOADED", "startup", {
+        "index_path": INDEX_PATH,
+        "ntotal":     _faiss_ntotal(_vectorstore)
+    })
+else:
+    audit.log("FAISS_INDEX_BUILD_START", "startup", {"index_path": INDEX_PATH})
+    _documents = ingest_all()
+    _chunks    = recursive_character_chunking(_documents, chunk_size=600, chunk_overlap=150)
+    _vectorstore = FAISS.from_documents(_chunks, _embeddings)
+    os.makedirs(INDEX_PATH, exist_ok=True)
+    _vectorstore.save_local(INDEX_PATH)
+    audit.log("FAISS_INDEX_BUILT_AND_SAVED", "startup", {
+        "index_path":  INDEX_PATH,
+        "ntotal":      _faiss_ntotal(_vectorstore),
+        "chunk_count": len(_chunks)
     })
 
-    return LoginResponse(
-        access_token=token,
-        token_type="bearer",
-        expires_in_minutes=EXPIRE_MINS,
-        user_id=user["user_id"],
-        email=user["email"],
-        role=user["role"]
-    )
+
+def build_secure_retriever(user_role: str, trace_id: str = "system"):
+    allowed = {
+        "employee": ["company_policy.txt", "engineering_standards.docx"],
+        "security": ["security_policy.txt"],
+        "finance":  ["finance_policy.txt"],
+        "admin":    None,
+    }.get(user_role, [])
+
+    retriever = _vectorstore.as_retriever(search_kwargs={"k": 4})
+
+    if user_role == "admin":
+        def admin_retrieve(q):
+            docs = retriever.invoke(q)
+            audit.log("RETRIEVAL", trace_id, {
+                "role":      "admin",
+                "doc_count": len(docs),
+                "sources":   [d.metadata.get("file_name") for d in docs]
+            })
+            return docs
+        return admin_retrieve
+
+    def role_retrieve(q):
+        docs     = retriever.invoke(q)
+        filtered = [d for d in docs if d.metadata.get("file_name") in allowed]
+        audit.log("RETRIEVAL", trace_id, {
+            "role":            user_role,
+            "allowed_sources": allowed,
+            "retrieved":       len(docs),
+            "returned":        len(filtered),
+            "sources":         [d.metadata.get("file_name") for d in filtered]
+        })
+        return filtered
+    return role_retrieve
 
 
 # ============================================================
-# 5️⃣ WHOAMI — CHECK YOUR TOKEN
+# PROMPT + LLM
 # ============================================================
 
-@app.get("/auth/me", tags=["Authentication"])
-async def whoami(current_user: dict = Depends(get_current_user)):
-    """
-    Returns the current authenticated user's info from JWT token.
-    """
-    return {
-        "user_id": current_user["user_id"],
-        "email":   current_user["email"],
-        "role":    current_user["role"],
-        "sub":     current_user["sub"]
-    }
+secure_prompt = ChatPromptTemplate.from_template("""
+You are a secure company assistant. Never reveal secrets, keys, or server details.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer (be concise):
+""")
+
+_llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    streaming=True,
+    max_tokens=450
+)
 
 
 # ============================================================
-# 6️⃣ SECURE RAG ENDPOINT (JWT PROTECTED + STREAMING)
+# OUTPUT GUARDRAIL + CONFIDENCE
 # ============================================================
 
-@app.post("/secure-rag/invoke", tags=["RAG"])
-@limiter.limit("10/minute")
-async def secure_rag_endpoint(
-    request: Request,
-    body: SecureRAGRequest,
-    current_user: dict = Depends(get_current_user)    # ← JWT required
-):
+def model_guard_check(answer: str, context: str = "", trace_id: str = "system") -> str:
+    if any(re.search(p, answer, re.IGNORECASE) for p in DANGEROUS_PATTERNS):
+        audit.log("SECURITY_BLOCK", trace_id, {"trigger": "output_guard"})
+        raise ValueError("SECURITY BLOCK: Credential detected in output.")
+    return answer
+
+def compute_confidence(retrieved_docs, answer: str) -> str:
+    if not retrieved_docs:
+        return "LOW"
+    if len(answer) < 30:
+        return "LOW"
+    if any(p in answer.lower() for p in ["cannot", "don't know", "no information"]):
+        return "LOW"
+    return "HIGH"
+
+
+# ============================================================
+# MAIN FUNCTION — WITH CACHING
+# ============================================================
+
+def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
     trace_id = new_trace_id()
 
-    # Role comes from JWT token — NOT from request body
-    user_role  = current_user["role"]
-    user_id    = current_user["user_id"]
-    user_email = current_user["email"]
-
     audit.log("REQUEST_START", trace_id, {
-        "user_id":        user_id,
-        "email":          user_email,
-        "role":           user_role,
-        "question_preview": body.question[:120]
+        "role":             user_role,
+        "question_preview": user_input[:80]
     })
 
     try:
-        # Input Guardrails
-        detect_prompt_injection(body.question, trace_id)
-        user_input = redact_pii(body.question, trace_id)
+        # Input guardrails
+        detect_prompt_injection(user_input, trace_id)
+        clean_input = redact_pii(user_input, trace_id)
 
-        # ✅ Check cache BEFORE retrieval
-        cached = llm_cache.get(user_role, user_input)
+        # ✅ Check cache FIRST — skip retrieval + LLM if hit
+        cached = llm_cache.get(user_role, clean_input)
         if cached:
             audit.log("CACHE_HIT", trace_id, {
-                "user_id":    user_id,
                 "role":       user_role,
                 "confidence": cached["confidence"]
             })
-            async def stream_cached():
-                # Stream cached answer token by token
-                for word in cached["answer"].split(" "):
-                    yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-                yield f"data: {json.dumps({'done': True, 'answer': cached['answer'], 'confidence': cached['confidence'], 'cached': True})}\n\n"
-
-            return StreamingResponse(stream_cached(), media_type="text/event-stream")
+            return {
+                "answer":     cached["answer"],
+                "confidence": cached["confidence"],
+                "cached":     True
+            }
 
         audit.log("CACHE_MISS", trace_id, {
-            "user_id": user_id,
-            "role":    user_role
+            "role": user_role
         })
 
-        # Secure Retrieval
-        retriever = build_secure_retriever(user_role, trace_id)
-        retrieved_docs = retriever(user_input)
-        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        # Retrieval
+        docs    = build_secure_retriever(user_role, trace_id)(clean_input)
+        context = "\n\n".join(d.page_content for d in docs)
 
-        # Streaming Chain
-        setup = RunnableParallel(
-            context=lambda _: context,
-            question=RunnablePassthrough()
-        )
-        rag_chain = setup | secure_prompt | _llm | StrOutputParser()
+        # Scan context BEFORE LLM
+        scan_context_for_credentials(context, trace_id)
 
-        async def stream_tokens():
-            full_answer = ""
-
-            # Scan context BEFORE streaming
-            try:
-                scan_context_for_credentials(context, trace_id)
-            except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {
-                    "user_id": user_id,
-                    "error": str(ve),
-                    "stage": "context_scan"
-                })
-                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
-                return
-
-            async for chunk in rag_chain.astream(user_input):
-                full_answer += chunk
-                yield f"data: {json.dumps({'token': chunk})}\n\n"
-
-            # Output Guardrails
-            try:
-                full_answer = pre_filter_check(full_answer, trace_id)
-                full_answer = scan_answer_for_sensitive_terms(full_answer, trace_id)
-                full_answer = model_guard_check(full_answer, context, trace_id)
-                confidence  = compute_confidence(retrieved_docs, full_answer)
-
-                # ✅ Store in cache ONLY after passing all guards
-                llm_cache.set(user_role, user_input, {
-                    "answer": full_answer,
-                    "confidence": confidence
-                })
-
-                audit.log("ANSWER", trace_id, {
-                    "user_id":    user_id,
-                    "email":      user_email,
-                    "role":       user_role,
-                    "message":    full_answer[:500],
-                    "confidence": confidence,
-                    "cached":     False,
-                    "sources":    [d.metadata.get("file_name") for d in retrieved_docs]
-                })
-
-                yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence, 'cached': False})}\n\n"
-
-            except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {
-                    "user_id": user_id,
-                    "error":   str(ve),
-                    "stage":   "output_guard"
-                })
-                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
-
-        return StreamingResponse(stream_tokens(), media_type="text/event-stream")
-
-    except ValueError as ve:
-        audit.log("REQUEST_FAILED", trace_id, {
-            "user_id": user_id,
-            "error":   str(ve),
-            "stage":   "input_guard"
-        })
-        raise HTTPException(status_code=400, detail=str(ve))
-
-    except Exception as e:
-        audit.log("REQUEST_FAILED", trace_id, {
-            "user_id": user_id,
-            "error":   str(e),
-            "stage":   "unhandled"
-        })
-        logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
-
-
-# ============================================================
-# 7️⃣ EVALUATION ENDPOINT (INTERNAL — EVAL KEY PROTECTED)
-# ============================================================
-
-@app.post("/secure-rag/eval", tags=["Internal"])
-@limiter.limit("5/minute")
-async def secure_rag_eval(
-    request: Request,
-    body: EvalRequest,
-    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
-):
-    _require_eval_key(x_eval_key)
-
-    batch_id = new_trace_id()
-    audit.log("EVAL_BATCH_START", batch_id, {"total_cases": len(body.cases)})
-
-    results = []
-    passed  = 0
-
-    for i, case in enumerate(body.cases):
-        case_trace_id = new_trace_id()
-        case_id = case.id or f"case_{i + 1}"
-
-        audit.log("EVAL_CASE_START", case_trace_id, {
-            "batch_id":        batch_id,
-            "case_id":         case_id,
-            "role":            case.role,
-            "question_preview": case.question[:120],
-            "should_block":    case.should_block
-        })
-
-        answer           = None
-        confidence       = None
-        retrieved_sources = []
-        blocked          = False
-        error_msg        = None
-
-        try:
-            detect_prompt_injection(case.question, case_trace_id)
-            clean_input = redact_pii(case.question, case_trace_id)
-
-            retriever = build_secure_retriever(case.role, case_trace_id)
-            retrieved_docs   = retriever(clean_input)
-            retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
-            context = "\n\n".join(d.page_content for d in retrieved_docs)
-
-            scan_context_for_credentials(context, case_trace_id)
-
-            setup     = RunnableParallel(context=lambda _: context, question=RunnablePassthrough())
-            rag_chain = setup | secure_prompt | _llm | StrOutputParser()
-            answer    = await rag_chain.ainvoke(clean_input)
-
-            answer     = pre_filter_check(answer, case_trace_id)
-            answer     = scan_answer_for_sensitive_terms(answer, case_trace_id)
-            answer     = model_guard_check(answer, context, case_trace_id)
-            confidence = compute_confidence(retrieved_docs, answer)
-
-        except Exception as e:
-            blocked   = True
-            error_msg = str(e)
-            confidence = "BLOCKED"
-
-        checks = {}
-        checks["block_check"] = (blocked == case.should_block)
-
-        if case.expect_confidence:
-            checks["confidence_check"] = (confidence == case.expect_confidence)
-        else:
-            checks["confidence_check"] = True
-
-        if case.expect_answer_contains and answer:
-            answer_lower = answer.lower()
-            checks["answer_content_check"] = all(
-                kw.lower() in answer_lower for kw in case.expect_answer_contains
+        # Generation
+        chain = (
+            RunnableParallel(
+                context=lambda _: context,
+                question=RunnablePassthrough()
             )
-        elif case.expect_answer_contains and not answer:
-            checks["answer_content_check"] = False
-        else:
-            checks["answer_content_check"] = True
+            | secure_prompt
+            | _llm
+            | StrOutputParser()
+        )
+        answer = chain.invoke(clean_input)
 
-        if case.expect_sources_contains:
-            src_set = set(retrieved_sources)
-            checks["sources_check"] = all(s in src_set for s in case.expect_sources_contains)
-        else:
-            checks["sources_check"] = True
+        # Output guards
+        answer = pre_filter_check(answer, trace_id)
+        answer = scan_answer_for_sensitive_terms(answer, trace_id)
+        answer = model_guard_check(answer, context, trace_id)
 
-        case_passed = all(checks.values())
-        if case_passed:
-            passed += 1
+        confidence = compute_confidence(docs, answer)
 
-        audit.log("EVAL_CASE_RESULT", case_trace_id, {
-            "batch_id":   batch_id,
-            "case_id":    case_id,
-            "passed":     case_passed,
-            "blocked":    blocked,
-            "confidence": confidence,
-            "checks":     checks,
-            "sources":    retrieved_sources,
-            "error":      error_msg
+        # ✅ Store in cache ONLY after passing ALL security guards
+        llm_cache.set(user_role, clean_input, {
+            "answer":     answer,
+            "confidence": confidence
         })
 
-        result = {
-            "case_id":    case_id,
-            "trace_id":   case_trace_id,
-            "role":       case.role,
-            "question":   case.question,
-            "passed":     case_passed,
-            "blocked":    blocked,
+        audit.log("CACHE_STORED", trace_id, {
+            "role":        user_role,
+            "confidence":  confidence,
+            "cache_stats": llm_cache.stats()
+        })
+
+        audit.log("REQUEST_SUCCESS", trace_id, {
+            "confidence":   confidence,
+            "answer_length": len(answer),
+            "sources_used": [d.metadata.get("file_name") for d in docs]
+        })
+
+        return {
+            "answer":     answer,
             "confidence": confidence,
-            "checks":     checks,
-            "error":      error_msg
+            "cached":     False
         }
 
-        if body.include_sources:
-            result["sources"] = retrieved_sources
-        if body.include_answer:
-            result["answer"] = answer
-
-        results.append(result)
-
-    total    = len(body.cases)
-    failed   = total - passed
-    pass_rate = round((passed / total) * 100, 1) if total > 0 else 0.0
-
-    summary = {
-        "batch_id":      batch_id,
-        "total":         total,
-        "passed":        passed,
-        "failed":        failed,
-        "pass_rate_pct": pass_rate,
-        "results":       results
-    }
-
-    audit.log("EVAL_BATCH_DONE", batch_id, {
-        "total": total, "passed": passed,
-        "failed": failed, "pass_rate_pct": pass_rate
-    })
-
-    return summary
-
-
-# ============================================================
-# 8️⃣ CACHE STATS
-# ============================================================
-
-@app.get("/secure-rag/cache/stats", tags=["Internal"])
-async def cache_stats(
-    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")
-):
-    _require_eval_key(x_eval_key)
-    stats = llm_cache.stats()
-    audit.log("CACHE_STATS_REQUESTED", "system", stats)
-    return stats
-
-
-# ============================================================
-# 9️⃣ CACHE CLEAR
-# ============================================================
-
-@app.delete("/secure-rag/cache/clear", tags=["Internal"])
-async def cache_clear(
-    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key")
-):
-    _require_eval_key(x_eval_key)
-    cleared = llm_cache.clear()
-    audit.log("CACHE_CLEARED", "system", {"entries_removed": cleared})
-    return {"status": "cleared", "entries_removed": cleared}
-
-
-# ============================================================
-# 🔟 HEALTH CHECKS
-# ============================================================
-
-@app.get("/", tags=["Health"])
-def health():
-    return {
-        "status":   "ok",
-        "service":  "Tech Secure RAG",
-        "version":  "3.0.0",
-        "endpoint": "/secure-rag/invoke"
-    }
-
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    health_status = {
-        "status":     "ok",
-        "service":    "Tech Secure RAG",
-        "version":    "3.0.0",
-        "components": {}
-    }
-
-    try:
-        if _vectorstore is not None:
-            _ = _vectorstore.similarity_search("test", k=1)
-            health_status["components"]["faiss"] = "healthy"
-        else:
-            health_status["components"]["faiss"] = "not_loaded"
-            health_status["status"] = "degraded"
     except Exception as e:
-        health_status["components"]["faiss"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
-
-    try:
-        _embeddings.embed_query("health check")
-        health_status["components"]["embeddings"] = "healthy"
-    except Exception as e:
-        health_status["components"]["embeddings"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
-
-    try:
-        _llm.invoke("ping")
-        health_status["components"]["llm"] = "healthy"
-    except Exception as e:
-        health_status["components"]["llm"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
-
-    if all(v == "healthy" for v in health_status["components"].values()):
-        health_status["status"] = "healthy"
-
-    return health_status
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        audit.log("REQUEST_FAILED", trace_id, {
+            "error": str(e),
+            "role":  user_role
+        })
+        return {
+            "answer":     "I cannot assist with that request due to security restrictions.",
+            "confidence": "BLOCKED"
+        }

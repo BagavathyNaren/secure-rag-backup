@@ -333,8 +333,10 @@ STRICT ANSWERING RULES:
 - If the Context does not contain the exact requested detail, reply:
   "Not specified in the provided context."
 
-CLARIFICATION RULE:
-- If the question asks for one thing (e.g., "approval limits/thresholds") but the Context only contains something related (e.g., "reimbursement caps"), explicitly say that the context only covers the related item and that the requested detail is not specified.
+ACCESS-AWARE RULES:
+- The user role is: {role}
+- You may ONLY answer from the retrieved sources listed below: {sources}
+- If the question asks about a domain/policy (e.g., finance/security) but the retrieved sources do not include that domain, explicitly say you may not have access to that policy and answer only what is available (or say it's not specified).
 
 Context:
 {context}

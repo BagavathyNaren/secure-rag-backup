@@ -24,7 +24,6 @@ try:
         create_access_token,
         get_current_user,
         require_role,
-        decode_token,
         EXPIRE_MINS
     )
     AUTH_AVAILABLE = True
@@ -33,6 +32,13 @@ except Exception as e:
     print(f"[STARTUP ERROR] Failed to import app.auth: {e}")
     print(tb.format_exc())
     AUTH_AVAILABLE = False
+
+    # ✅ Stub so the app can still start; /secure-rag/invoke will return a clear error.
+    def get_current_user():  # type: ignore
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication module failed to load; JWT auth is unavailable."
+        )
 
 from app.secure_rag import (
     detect_prompt_injection,
@@ -233,30 +239,14 @@ else:
 async def secure_rag_endpoint(
     request: Request,
     body: SecureRAGRequest,
+    current_user: dict = Depends(get_current_user),  # ✅ PATCH: Swagger will attach token automatically
 ):
     trace_id = new_trace_id()
 
-    # ✅ Role comes EXCLUSIVELY from JWT token — never from request body
-    if AUTH_AVAILABLE:
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "Missing or invalid Authorization header. "
-                    "Please login at /auth/login to get your token, "
-                    "then add: Authorization: Bearer <token>"
-                )
-            )
-        token        = auth_header.split(" ", 1)[1]
-        current_user = decode_token(token)
-        user_role    = current_user["role"]
-        user_id      = current_user["user_id"]
-        user_email   = current_user["email"]
-    else:
-        user_role  = "employee"
-        user_id    = "anonymous"
-        user_email = "anonymous"
+    # ✅ PATCH: role comes from dependency (JWT), no manual header parsing
+    user_role  = current_user["role"]
+    user_id    = current_user["user_id"]
+    user_email = current_user["email"]
 
     audit.log("REQUEST_START", trace_id, {
         "user_id":          user_id,

@@ -189,6 +189,28 @@ def _require_rag_ready():
             detail="Service initializing. Please retry in a few seconds.",
         )
 
+@app.on_event("shutdown")
+async def shutdown():
+    rag.audit.log("SHUTDOWN_START", "system", {})
+
+    # 1) Close RAG resources (Redis connection, etc.)
+    try:
+        rag.shutdown_rag()
+        rag.audit.log("RAG_SHUTDOWN_OK", "system", {})
+    except Exception as e:
+        rag.audit.log("RAG_SHUTDOWN_ERROR", "system", {"error": str(e)})
+
+    # 2) Dispose DB engine (Async SQLAlchemy)
+    if DB_AVAILABLE:
+        try:
+            from db.connection import engine
+            await engine.dispose()
+            rag.audit.log("DB_ENGINE_DISPOSED", "system", {})
+        except Exception as e:
+            rag.audit.log("DB_ENGINE_DISPOSE_ERROR", "system", {"error": str(e)})
+
+    rag.audit.log("SHUTDOWN_COMPLETE", "system", {})
+
 # ============================================================
 # 5️⃣  AUTH ENDPOINTS
 # ============================================================

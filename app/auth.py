@@ -1,6 +1,9 @@
 # app/auth.py
 
 import os
+from sqlalchemy import select, or_
+from db.connection import AsyncSessionLocal
+from models.database import User as UserModel
 import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional, Dict
@@ -42,7 +45,44 @@ def verify_password(plain: str, hashed: str) -> bool:
         plain[:72].encode("utf-8"),      # same 72 byte limit
         hashed.encode("utf-8")
     )
+def _user_to_dict(u: UserModel) -> dict:
+    return {
+        "user_id": u.user_id,
+        "username": u.username,
+        "email": u.email,
+        "role": (u.role.value if hasattr(u.role, "value") else str(u.role)),
+        "hashed_password": u.hashed_password,
+        "active": bool(u.is_active),
+        "is_locked": bool(getattr(u, "is_locked", False)),
+    }
 
+
+async def authenticate_user_pg(identifier: str, password: str) -> Optional[dict]:
+    """
+    Authenticate against PostgreSQL (Neon).
+    Identifier may be username OR email OR user_id.
+    Returns a user dict compatible with create_access_token().
+    """
+    async with AsyncSessionLocal() as session:
+        stmt = select(UserModel).where(
+            or_(
+                UserModel.username == identifier,
+                UserModel.email == identifier,
+                UserModel.user_id == identifier,
+            )
+        )
+        user_obj = (await session.execute(stmt)).scalar_one_or_none()
+
+    if not user_obj:
+        return None
+    if not user_obj.is_active:
+        return None
+    if getattr(user_obj, "is_locked", False):
+        return None
+    if not verify_password(password, user_obj.hashed_password):
+        return None
+
+    return _user_to_dict(user_obj)
 
 # ============================================================
 # MOCK USER DATABASE

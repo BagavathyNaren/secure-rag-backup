@@ -14,6 +14,7 @@ import json
 import traceback
 import logging
 import os
+from datetime import datetime, timezone
 
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -189,18 +190,28 @@ def _require_rag_ready():
             detail="Service initializing. Please retry in a few seconds.",
         )
 
+
+
 @app.on_event("shutdown")
 async def shutdown():
     rag.audit.log("SHUTDOWN_START", "system", {})
 
-    # 1) Close RAG resources (Redis connection, etc.)
+    # Write marker FIRST (so next startup can prove shutdown happened)
+    try:
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        rag.write_last_shutdown_marker(ts)
+        rag.audit.log("SHUTDOWN_MARKER_WRITTEN", "system", {"ts": ts})
+    except Exception as e:
+        rag.audit.log("SHUTDOWN_MARKER_ERROR", "system", {"error": str(e)})
+
+    # Close RAG resources (Redis connections, etc.)
     try:
         rag.shutdown_rag()
         rag.audit.log("RAG_SHUTDOWN_OK", "system", {})
     except Exception as e:
         rag.audit.log("RAG_SHUTDOWN_ERROR", "system", {"error": str(e)})
 
-    # 2) Dispose DB engine (Async SQLAlchemy)
+    # Dispose DB engine
     if DB_AVAILABLE:
         try:
             from db.connection import engine

@@ -1,97 +1,71 @@
 # db/connection.py
-
-import os
 import logging
-import ssl
-from sqlalchemy.ext.asyncio import (
-    create_async_engine,
-    AsyncSession,
-    async_sessionmaker,
-)
-from sqlalchemy.pool import NullPool
-from models.database import Base
+import os
+import re
+
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import event
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# CONNECTION STRING
-# ============================================================
+_SECRET_RE = re.compile(r"(?<=://)[^:]+:[^@]+(?=@)")
 
-# Neon gives: postgresql://user:pass@host/db?sslmode=require
-# asyncpg needs: postgresql+asyncpg://user:pass@host/db
-# We strip ?sslmode=require and handle SSL via connect_args
 
-_raw_url = os.environ.get("DATABASE_URL", "")
+def _mask_url(url: str) -> str:
+    return _SECRET_RE.sub("***", url)
 
-# Step 1 — replace scheme for asyncpg driver
-_async_url = _raw_url.replace(
-    "postgresql://",
-    "postgresql+asyncpg://"
-).replace(
-    "postgres://",          # some providers use postgres:// shorthand
-    "postgresql+asyncpg://"
-)
 
-# Step 2 — strip ?sslmode=require from URL
-#           (we pass SSL properly via connect_args instead)
-if "?" in _async_url:
-    _async_url = _async_url.split("?")[0]
+def _normalize_asyncpg_url(url: str) -> str:
+    """
+    Convert DATABASE_URL to asyncpg format:
+    1. postgresql:// → postgresql+asyncpg://
+    2. Strip ALL query parameters (sslmode, channel_binding, etc.)
+    """
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-# ============================================================
-# SSL CONTEXT
-# ============================================================
+    # Strip query params — asyncpg handles SSL via connect_args
+    if "?" in url:
+        url = url.split("?")[0]
 
-# asyncpg expects an ssl.SSLContext object, not a string
-_ssl_context = ssl.create_default_context()
-_ssl_context.check_hostname = True
-_ssl_context.verify_mode    = ssl.CERT_REQUIRED
+    return url
 
-# ============================================================
-# ENGINE
-# ============================================================
 
+def _get_async_database_url() -> str:
+    raw = os.getenv("DATABASE_URL", "").strip()
+    if not raw:
+        raise RuntimeError("DATABASE_URL environment variable is not set.")
+    return _normalize_asyncpg_url(raw)
+
+
+_async_url = _get_async_database_url()
+
+# ── engine ────────────────────────────────────────────────────────────────────
 engine = create_async_engine(
     _async_url,
-    echo=False,          # Set True to debug SQL queries
+    echo=False,
     pool_pre_ping=True,
-    poolclass=NullPool,  # Required for serverless (Neon)
-    connect_args={
-        "ssl": _ssl_context   # ✅ correct way for asyncpg
-    },
+    pool_size=5,
+    max_overflow=10,
+    connect_args={"ssl": "require"},  # ← asyncpg SSL parameter
 )
 
-# ============================================================
-# SESSION FACTORY
-# ============================================================
+# ── safe connect-event log ────────────────────────────────────────────────────
+@event.listens_for(engine.sync_engine, "connect")
+def _on_connect(dbapi_conn, connection_record):
+    logger.debug("New DB connection → %s", _mask_url(_async_url))
 
-AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
+
+AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
+    bind=engine,
     expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
 )
 
-# ============================================================
-# DEPENDENCY — FastAPI route injection
-# ============================================================
 
 async def get_db():
-    """Dependency injection for FastAPI routes."""
     async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
-
-# ============================================================
-# TABLE CREATION — called on startup
-# ============================================================
-
-async def init_db():
-    """Create all tables if they don't exist."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables created/verified")
+        yield session

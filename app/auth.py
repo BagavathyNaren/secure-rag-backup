@@ -1,6 +1,9 @@
 # app/auth.py
 
 import os
+from sqlalchemy import select, or_
+from db.connection import AsyncSessionLocal
+from models.database import User as UserModel
 import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional, Dict
@@ -42,52 +45,49 @@ def verify_password(plain: str, hashed: str) -> bool:
         plain[:72].encode("utf-8"),      # same 72 byte limit
         hashed.encode("utf-8")
     )
-
-
-# ============================================================
-# MOCK USER DATABASE
-# Passwords are bcrypt hashed at module load time.
-#
-# In production → replace with real DB (PostgreSQL, etc.)
-#
-# To generate a hash manually in Python:
-#   import bcrypt
-#   print(bcrypt.hashpw(b"your_password", bcrypt.gensalt()).decode())
-# ============================================================
-
-def _make_user(user_id, username, email, role, password) -> dict:
+def _user_to_dict(u: UserModel) -> dict:
     return {
-        "user_id":         user_id,
-        "username":        username,
-        "email":           email,
-        "role":            role,
-        "hashed_password": hash_password(password),
-        "active":          True,
+        "user_id": u.user_id,
+        "username": u.username,
+        "email": u.email,
+        "role": (u.role.value if hasattr(u.role, "value") else str(u.role)),
+        "hashed_password": u.hashed_password,
+        "active": bool(u.is_active),
+        "is_locked": bool(getattr(u, "is_locked", False)),
     }
 
-USERS_DB: Dict[str, dict] = {
-    "alice": _make_user("usr_001", "alice", "alice@techcorp.com", "employee", "employee_pass"),
-    "bob":   _make_user("usr_002", "bob",   "bob@techcorp.com",   "finance",  "finance_pass"),
-    "carol": _make_user("usr_003", "carol", "carol@techcorp.com", "security", "security_pass"),
-    "dave":  _make_user("usr_004", "dave",  "dave@techcorp.com",  "admin",    "admin_pass"),
-}
 
+async def authenticate_user_pg(identifier: str, password: str) -> Optional[dict]:
+    """
+    Authenticate against PostgreSQL (Neon).
+    Identifier may be username OR email OR user_id.
+    Returns a user dict compatible with create_access_token().
+    """
+    async with AsyncSessionLocal() as session:
+        stmt = select(UserModel).where(
+            or_(
+                UserModel.username == identifier,
+                UserModel.email == identifier,
+                UserModel.user_id == identifier,
+            )
+        )
+        user_obj = (await session.execute(stmt)).scalar_one_or_none()
 
-# ============================================================
-# USER AUTHENTICATION
-# ============================================================
-
-def authenticate_user(username: str, password: str) -> Optional[dict]:
-    user = USERS_DB.get(username)
-    if not user:
+    if not user_obj:
         return None
-    if not user["active"]:
+    if not user_obj.is_active:
         return None
-    if not verify_password(password, user["hashed_password"]):
+    if getattr(user_obj, "is_locked", False):
         return None
-    return user
+    if not verify_password(password, user_obj.hashed_password):
+        return None
 
+    return _user_to_dict(user_obj)
 
+# Backward-compatible name: remove mock auth entirely, keep API stable
+async def authenticate_user(identifier: str, password: str) -> Optional[dict]:
+    return await authenticate_user_pg(identifier, password)
+    
 # ============================================================
 # JWT HELPERS
 # ============================================================
@@ -141,22 +141,29 @@ def decode_token(token: str) -> dict:
 # FASTAPI DEPENDENCIES
 # ============================================================
 
-def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
-    """
-    FastAPI dependency — validates JWT and returns user payload.
-    Usage: current_user = Depends(get_current_user)
-    """
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     payload = decode_token(token)
-
-    # Double-check user still exists and is active
     username = payload.get("sub")
-    user = USERS_DB.get(username)
-    if not user or not user["active"]:
+
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token: missing subject.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Verify user still exists and is active in Postgres
+    async with AsyncSessionLocal() as session:
+        stmt = select(UserModel).where(UserModel.username == username)
+        user_obj = (await session.execute(stmt)).scalar_one_or_none()
+
+    if not user_obj or not user_obj.is_active or getattr(user_obj, "is_locked", False):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or deactivated.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
     return payload
 
 

@@ -170,6 +170,11 @@ async def startup():
 
     # 2) Cache init (Redis if available else memory)
     rag.init_cache()
+    prev = rag.read_last_shutdown_marker()
+    if prev:
+        rag.audit.log("PREVIOUS_SHUTDOWN_MARKER", "startup", {"last_shutdown_ts": prev})
+    else:
+        rag.audit.log("PREVIOUS_SHUTDOWN_MARKER", "startup", {"last_shutdown_ts": None})
 
     # 3) Vectorstore init (FAISS load/build)
     force_rebuild = os.getenv("REBUILD_FAISS", "0").strip() == "1"

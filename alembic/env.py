@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import re
+import sys
 
 from alembic import context
 from logging.config import fileConfig
@@ -17,32 +18,38 @@ def _mask_url(url: str) -> str:
     return _SECRET_RE.sub("***", url)
 
 
-# ── Alembic config object ─────────────────────────────────────────────────────
+# ── sys.path: ensure /app is resolvable regardless of how Alembic is invoked ──
+# upgrade_head() in db/migrations.py calls alembic programmatically, which
+# changes the working directory.  Anchoring to this file's grandparent
+# (/app/alembic/../  →  /app/) keeps all imports stable.
+_APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _APP_ROOT not in sys.path:
+    sys.path.insert(0, _APP_ROOT)
+
+# ── Alembic config ────────────────────────────────────────────────────────────
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Inject the real URL from the environment — Alembic never logs this value
-# because sqlalchemy.engine is kept at WARN in alembic.ini
+# Inject DATABASE_URL — raw value goes to Alembic internals only, never logged
 _raw_url = os.getenv("DATABASE_URL", "").strip()
 if not _raw_url:
     raise RuntimeError("DATABASE_URL is not set — Alembic cannot continue.")
 
 config.set_main_option("sqlalchemy.url", _raw_url)
-
-# Only the masked form appears in any log record
-logger.info("Alembic targeting: %s", _mask_url(_raw_url))
+logger.info("Alembic targeting: %s", _mask_url(_raw_url))   # ✅ masked
 
 # ── metadata ──────────────────────────────────────────────────────────────────
-from db.base import Base          # noqa: E402
+# Base lives in models/database.py  (not db/base.py or app/db.py)
+from models.database import Base          # noqa: E402
 target_metadata = Base.metadata
 
 
-# ── migration runners ─────────────────────────────────────────────────────────
+# ── runners ───────────────────────────────────────────────────────────────────
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
-    logger.info("Offline mode → %s", _mask_url(url))   # masked
+    logger.info("Offline mode → %s", _mask_url(url))   # ✅ masked
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -59,7 +66,7 @@ def run_migrations_online() -> None:
         cfg,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
-        echo=False,          # ← credentials never echoed to logs
+        echo=False,      # ← must stay False; echo=True leaks credentials
     )
     logger.info("Online migration engine ready.")   # no URL here
 

@@ -1,5 +1,6 @@
 # db/migrations.py
 import logging
+import io  
 import os
 import re
 from alembic.config import Config

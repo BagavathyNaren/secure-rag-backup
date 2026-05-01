@@ -181,22 +181,29 @@ def decode_token(token: str) -> dict:
 # FASTAPI DEPENDENCIES
 # ============================================================
 
-def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
-    """
-    FastAPI dependency — validates JWT and returns user payload.
-    Usage: current_user = Depends(get_current_user)
-    """
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     payload = decode_token(token)
-
-    # Double-check user still exists and is active
     username = payload.get("sub")
-    user = USERS_DB.get(username)
-    if not user or not user["active"]:
+
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token: missing subject.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Verify user still exists and is active in Postgres
+    async with AsyncSessionLocal() as session:
+        stmt = select(UserModel).where(UserModel.username == username)
+        user_obj = (await session.execute(stmt)).scalar_one_or_none()
+
+    if not user_obj or not user_obj.is_active or getattr(user_obj, "is_locked", False):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or deactivated.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
     return payload
 
 

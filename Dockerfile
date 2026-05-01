@@ -43,6 +43,6 @@ ENV PATH=/root/.local/bin:$PATH
 # Expose the port your app runs on
 EXPOSE 7860
 
-# Command to run the app
+# Command to run the ap
 # Make sure 'app.server:app' matches your file structure
-CMD ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "7860", "--proxy-headers", "--forwarded-allow-ips", "*"]

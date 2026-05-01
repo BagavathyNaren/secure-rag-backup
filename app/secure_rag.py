@@ -5,17 +5,17 @@ import json
 import uuid
 import hashlib
 import time
+import os
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-import os
 
-from app.config import *
+from app.config import *  # keep as-is if you rely on it elsewhere
 from app.ingestion import ingest_all
 from app.chunking import recursive_character_chunking
 
@@ -25,7 +25,7 @@ from app.chunking import recursive_character_chunking
 # ============================================================
 
 class AuditLogger:
-    def log(self, event: str, trace_id: str = "system", data: dict = None):
+    def log(self, event: str, trace_id: str = "system", data: dict | None = None):
         entry = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "trace_id": trace_id,
@@ -54,17 +54,36 @@ def log_event(event_type: str, data):
 
 
 # ============================================================
-# ✅ LLM ANSWER CACHE
+# SETTINGS (read env, but do NOT initialize here)
 # ============================================================
 
-class LLMCache:
-    """
-    In-memory TTL cache for LLM answers.
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_TTL_SECONDS = int(os.getenv("REDIS_TTL_SECONDS", "3600"))
+REDIS_PREFIX = os.getenv("REDIS_PREFIX", "secure_rag:cache:v1:")
 
-    Key   : SHA256(role + "|" + normalized_question)
-    Value : {"answer": str, "confidence": str}
-    TTL   : 300 seconds (5 minutes) by default
-    Max   : 200 entries — FIFO eviction when full
+INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "faiss_index")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-3-small")
+
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+
+
+# ============================================================
+# GLOBALS (initialized during FastAPI startup)
+# ============================================================
+
+llm_cache = None            # type: ignore[assignment]
+_embeddings = None           # type: ignore[assignment]
+_vectorstore = None          # type: ignore[assignment]
+_llm = None                 # type: ignore[assignment]
+
+
+# ============================================================
+# CACHE BACKENDS
+# ============================================================
+
+class InMemoryLLMCache:
+    """
+    In-memory TTL cache (fallback). Same interface as RedisLLMCache.
     """
     def __init__(self, ttl_seconds: int = 300, max_entries: int = 200):
         self._store: Dict[str, dict] = {}
@@ -92,24 +111,22 @@ class LLMCache:
             del self._store[oldest_key]
 
         key = self._make_key(role, question)
-        self._store[key] = {
-            "value": value,
-            "expires_at": time.monotonic() + self._ttl,
-        }
+        self._store[key] = {"value": value, "expires_at": time.monotonic() + self._ttl}
 
     def invalidate(self, role: str, question: str) -> None:
         self._store.pop(self._make_key(role, question), None)
 
     def clear(self) -> int:
-        count = len(self._store)
+        n = len(self._store)
         self._store.clear()
-        return count
+        return n
 
     def stats(self) -> dict:
         now = time.monotonic()
         active = sum(1 for e in self._store.values() if e["expires_at"] > now)
         expired = len(self._store) - active
         return {
+            "backend": "memory",
             "total_entries": len(self._store),
             "active_entries": active,
             "expired_entries": expired,
@@ -118,14 +135,244 @@ class LLMCache:
         }
 
 
-# Global cache instance
-llm_cache = LLMCache(ttl_seconds=300, max_entries=200)
+class RedisLLMCache:
+    """
+    Redis TTL cache.
 
-audit.log("CACHE_INIT", "startup", {"ttl_seconds": 300, "max_entries": 200})
+    Keys:  <REDIS_PREFIX><sha256(role|question)>
+    Value: JSON string {"answer": "...", "confidence": "HIGH"}
+    TTL:   redis expire (seconds)
+    """
+    def __init__(self, redis_url: str, ttl_seconds: int, prefix: str):
+        import redis  # requires redis==5.x
+
+        self._ttl = ttl_seconds
+        self._prefix = prefix
+
+        self._client = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+            health_check_interval=30,
+        )
+
+        # Fail fast; caller can fallback
+        self._client.ping()
+
+    def _make_key(self, role: str, question: str) -> str:
+        normalized = question.strip().lower()
+        raw = f"{role}|{normalized}"
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        return f"{self._prefix}{digest}"
+
+    def get(self, role: str, question: str) -> Optional[dict]:
+        key = self._make_key(role, question)
+        raw = self._client.get(key)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            self._client.delete(key)
+            return None
+
+    def set(self, role: str, question: str, value: dict) -> None:
+        key = self._make_key(role, question)
+        self._client.setex(key, self._ttl, json.dumps(value))
+
+    def invalidate(self, role: str, question: str) -> None:
+        key = self._make_key(role, question)
+        self._client.delete(key)
+
+    def clear(self) -> int:
+        pattern = f"{self._prefix}*"
+        deleted = 0
+        pipe = self._client.pipeline(transaction=False)
+
+        batch = 0
+        for k in self._client.scan_iter(match=pattern, count=500):
+            pipe.delete(k)
+            batch += 1
+            if batch >= 500:
+                deleted += sum(pipe.execute())
+                batch = 0
+
+        if batch:
+            deleted += sum(pipe.execute())
+
+        return int(deleted)
+
+    def stats(self) -> dict:
+        pattern = f"{self._prefix}*"
+        count = 0
+        for _ in self._client.scan_iter(match=pattern, count=500):
+            count += 1
+            if count >= 5000:
+                break
+        return {
+            "backend": "redis",
+            "prefix": self._prefix,
+            "ttl_seconds": self._ttl,
+            "approx_entries": count,
+        }
 
 
 # ============================================================
-# NUCLEAR BLOCKS
+# INIT FUNCTIONS (production-grade: called in FastAPI startup)
+# ============================================================
+
+def init_cache(force: bool = False) -> Any:
+    """
+    Initialize llm_cache.
+    - Redis if configured and reachable
+    - else fallback to in-memory
+    """
+    global llm_cache
+
+    if llm_cache is not None and not force:
+        audit.log("CACHE_INIT_SKIPPED", "startup", {"reason": "already_initialized"})
+        return llm_cache
+
+    try:
+        if REDIS_URL:
+            llm_cache = RedisLLMCache(REDIS_URL, REDIS_TTL_SECONDS, REDIS_PREFIX)
+            audit.log("CACHE_INIT", "startup", {
+                "backend": "redis",
+                "ttl_seconds": REDIS_TTL_SECONDS,
+                "prefix": REDIS_PREFIX,
+            })
+        else:
+            llm_cache = InMemoryLLMCache(ttl_seconds=REDIS_TTL_SECONDS, max_entries=200)
+            audit.log("CACHE_INIT", "startup", {
+                "backend": "memory",
+                "ttl_seconds": REDIS_TTL_SECONDS,
+                "max_entries": 200,
+            })
+    except Exception as e:
+        llm_cache = InMemoryLLMCache(ttl_seconds=REDIS_TTL_SECONDS, max_entries=200)
+        audit.log("CACHE_INIT_FALLBACK", "startup", {
+            "backend": "memory",
+            "reason": "redis_unavailable",
+            "error": str(e),
+            "ttl_seconds": REDIS_TTL_SECONDS,
+            "max_entries": 200,
+        })
+
+    return llm_cache
+
+
+def init_embeddings(force: bool = False) -> OpenAIEmbeddings:
+    global _embeddings
+
+    if _embeddings is not None and not force:
+        audit.log("EMBEDDINGS_INIT_SKIPPED", "startup", {"reason": "already_initialized"})
+        return _embeddings
+
+    _embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
+    audit.log("EMBEDDINGS_INIT", "startup", {"embedding_model": EMBEDDING_MODEL_NAME})
+    return _embeddings
+
+
+def _faiss_ntotal(vs) -> int:
+    try:
+        return int(vs.index.ntotal)
+    except Exception:
+        return -1
+
+
+def init_vectorstore(force_rebuild: bool = False) -> FAISS:
+    """
+    Initialize FAISS vectorstore:
+    - If index exists and not force_rebuild -> load
+    - Else -> build from documents, then save
+    """
+    global _vectorstore
+
+    init_embeddings()
+
+    index_exists = os.path.exists(INDEX_PATH)
+
+    audit.log("FAISS_INDEX_CHECK", "startup", {
+        "index_path": INDEX_PATH,
+        "exists": index_exists,
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "force_rebuild": force_rebuild,
+    })
+
+    if index_exists and not force_rebuild:
+        audit.log("FAISS_INDEX_LOAD_START", "startup", {"index_path": INDEX_PATH})
+        try:
+            _vectorstore = FAISS.load_local(
+                INDEX_PATH,
+                _embeddings,
+                allow_dangerous_deserialization=True,
+            )
+        except Exception as e:
+            audit.log("FAISS_INDEX_LOAD_FAILED", "startup", {"error": str(e)})
+            raise
+
+        audit.log("FAISS_INDEX_LOADED", "startup", {
+            "index_path": INDEX_PATH,
+            "ntotal": _faiss_ntotal(_vectorstore),
+        })
+        return _vectorstore
+
+    audit.log("FAISS_INDEX_BUILD_START", "startup", {"index_path": INDEX_PATH})
+
+    documents = ingest_all()
+    chunks = recursive_character_chunking(documents, chunk_size=600, chunk_overlap=150)
+    _vectorstore = FAISS.from_documents(chunks, _embeddings)
+
+    os.makedirs(INDEX_PATH, exist_ok=True)
+    _vectorstore.save_local(INDEX_PATH)
+
+    audit.log("FAISS_INDEX_BUILT_AND_SAVED", "startup", {
+        "index_path": INDEX_PATH,
+        "ntotal": _faiss_ntotal(_vectorstore),
+        "chunk_count": len(chunks),
+    })
+    return _vectorstore
+
+
+def init_llm(force: bool = False) -> ChatOpenAI:
+    global _llm
+
+    if _llm is not None and not force:
+        audit.log("LLM_INIT_SKIPPED", "startup", {"reason": "already_initialized"})
+        return _llm
+
+    _llm = ChatOpenAI(
+        model=LLM_MODEL_NAME,
+        temperature=0,
+        streaming=True,
+        max_tokens=450,
+    )
+    audit.log("LLM_INIT", "startup", {"model": LLM_MODEL_NAME})
+    return _llm
+
+
+def ensure_initialized() -> None:
+    missing = []
+    if llm_cache is None:
+        missing.append("llm_cache")
+    if _embeddings is None:
+        missing.append("_embeddings")
+    if _vectorstore is None:
+        missing.append("_vectorstore")
+    if _llm is None:
+        missing.append("_llm")
+
+    if missing:
+        raise RuntimeError(
+            "Secure RAG is not initialized. Missing: "
+            + ", ".join(missing)
+            + ". Ensure startup calls init_cache/init_vectorstore/init_llm."
+        )
+
+
+# ============================================================
+# GUARDRAILS (unchanged)
 # ============================================================
 
 DANGEROUS_PATTERNS = [
@@ -144,10 +391,6 @@ def pre_filter_check(answer: str, trace_id: str = "system") -> str:
             raise ValueError("SECURITY BLOCK: Credential detected.")
     return answer
 
-
-# ============================================================
-# CONTEXT CREDENTIAL SCANNER
-# ============================================================
 
 SENSITIVE_CONTEXT_PATTERNS = [
     r"AKIA[0-9A-Z]{16}",
@@ -173,10 +416,6 @@ def scan_context_for_credentials(context: str, trace_id: str = "system") -> None
             )
 
 
-# ============================================================
-# SENSITIVE ANSWER TERM SCANNER
-# ============================================================
-
 SENSITIVE_ANSWER_TERMS = [
     r"(?i)(api\s*key|secret\s*key|access\s*key|private\s*key)",
     r"(?i)(aws|s3).{0,20}(key|credential|secret|token)",
@@ -197,10 +436,6 @@ def scan_answer_for_sensitive_terms(answer: str, trace_id: str = "system") -> st
             raise ValueError("SECURITY BLOCK: Answer references sensitive credential terms.")
     return answer
 
-
-# ============================================================
-# INPUT GUARDRAILS
-# ============================================================
 
 INJECTION_PATTERNS = [
     r"ignore previous",
@@ -227,58 +462,13 @@ def redact_pii(text: str, trace_id: str = "system") -> str:
 
 
 # ============================================================
-# VECTORSTORE & RETRIEVAL (WITH STARTUP LOGS)
+# VECTORSTORE & RETRIEVAL (no startup side effects)
 # ============================================================
 
-INDEX_PATH = "faiss_index"
-EMBEDDING_MODEL_NAME = "text-embedding-3-small"
-_embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL_NAME)
-
-def _faiss_ntotal(vs) -> int:
-    try:
-        return int(vs.index.ntotal)
-    except Exception:
-        return -1
-
-_index_exists = os.path.exists(INDEX_PATH)
-
-audit.log("FAISS_INDEX_CHECK", "startup", {
-    "index_path": INDEX_PATH,
-    "exists": _index_exists,
-    "embedding_model": EMBEDDING_MODEL_NAME,
-})
-
-if _index_exists:
-    audit.log("FAISS_INDEX_LOAD_START", "startup", {"index_path": INDEX_PATH})
-    try:
-        _vectorstore = FAISS.load_local(
-            INDEX_PATH,
-            _embeddings,
-            allow_dangerous_deserialization=True,
-        )
-    except Exception as e:
-        audit.log("FAISS_INDEX_LOAD_FAILED", "startup", {"error": str(e)})
-        raise
-
-    audit.log("FAISS_INDEX_LOADED", "startup", {
-        "index_path": INDEX_PATH,
-        "ntotal": _faiss_ntotal(_vectorstore),
-    })
-else:
-    audit.log("FAISS_INDEX_BUILD_START", "startup", {"index_path": INDEX_PATH})
-    _documents = ingest_all()
-    _chunks = recursive_character_chunking(_documents, chunk_size=600, chunk_overlap=150)
-    _vectorstore = FAISS.from_documents(_chunks, _embeddings)
-    os.makedirs(INDEX_PATH, exist_ok=True)
-    _vectorstore.save_local(INDEX_PATH)
-    audit.log("FAISS_INDEX_BUILT_AND_SAVED", "startup", {
-        "index_path": INDEX_PATH,
-        "ntotal": _faiss_ntotal(_vectorstore),
-        "chunk_count": len(_chunks),
-    })
-
-
 def build_secure_retriever(user_role: str, trace_id: str = "system"):
+    if _vectorstore is None:
+        raise RuntimeError("Vectorstore not initialized. Call init_vectorstore() during startup.")
+
     allowed = {
         "employee": ["company_policy.txt", "engineering_standards.docx"],
         "security": ["security_policy.txt"],
@@ -315,7 +505,7 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
 
 
 # ============================================================
-# PROMPT + LLM
+# PROMPT (safe at import time)
 # ============================================================
 
 secure_prompt = ChatPromptTemplate.from_template("""
@@ -342,16 +532,9 @@ Question:
 Answer (be concise):
 """)
 
-_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    streaming=True,
-    max_tokens=450,
-)
-
 
 # ============================================================
-# OUTPUT GUARDRAIL + CONFIDENCE
+# OUTPUT GUARDRAIL + CONFIDENCE (unchanged)
 # ============================================================
 
 def model_guard_check(answer: str, context: str = "", trace_id: str = "system") -> str:
@@ -360,7 +543,7 @@ def model_guard_check(answer: str, context: str = "", trace_id: str = "system") 
         raise ValueError("SECURITY BLOCK: Credential detected in output.")
     return answer
 
-# ✅ UPDATED: downgrades "not specified" to LOW
+
 def compute_confidence(retrieved_docs, answer: str) -> str:
     if not retrieved_docs:
         return "LOW"
@@ -385,13 +568,76 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
         return "LOW"
 
     return "HIGH"
+    
+# ============================================================
+# Add shutdown helper
+# ============================================================
+
+def shutdown_rag() -> None:
+    """
+    Best-effort cleanup for external clients (Redis).
+    Safe to call multiple times.
+    """
+    global llm_cache
+
+    try:
+        # If Redis backend, close connections cleanly
+        if llm_cache is not None and hasattr(llm_cache, "_client"):
+            client = getattr(llm_cache, "_client", None)
+            if client is not None:
+                # redis-py 5 supports close(); keep try/except for compatibility
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+                # extra safe: disconnect pool
+                try:
+                    client.connection_pool.disconnect()
+                except Exception:
+                    pass
+    except Exception:
+        # Never raise during shutdown
+        pass
+
+LIFECYCLE_LAST_SHUTDOWN_KEY = "secure_rag:lifecycle:last_shutdown"
+
+def write_last_shutdown_marker(ts: str) -> None:
+    """
+    Store last shutdown timestamp in Redis (if using Redis cache).
+    No-op if cache backend isn't Redis.
+    """
+    global llm_cache
+    try:
+        if llm_cache is not None and hasattr(llm_cache, "_client"):
+            client = getattr(llm_cache, "_client", None)
+            if client is not None:
+                client.set(LIFECYCLE_LAST_SHUTDOWN_KEY, ts)
+    except Exception:
+        pass
+
+def read_last_shutdown_marker() -> str | None:
+    """
+    Read last shutdown timestamp from Redis (if using Redis cache).
+    """
+    global llm_cache
+    try:
+        if llm_cache is not None and hasattr(llm_cache, "_client"):
+            client = getattr(llm_cache, "_client", None)
+            if client is not None:
+                return client.get(LIFECYCLE_LAST_SHUTDOWN_KEY)
+    except Exception:
+        return None
+    return None
 
 
 # ============================================================
-# MAIN FUNCTION — WITH CACHING
+# MAIN FUNCTION — WITH CACHING (optional helper; unchanged logic)
 # ============================================================
 
 def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
+    ensure_initialized()
+
     trace_id = new_trace_id()
 
     audit.log("REQUEST_START", trace_id, {
@@ -400,16 +646,14 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
     })
 
     try:
-        # Input guardrails
         detect_prompt_injection(user_input, trace_id)
         clean_input = redact_pii(user_input, trace_id)
 
-        # ✅ Check cache FIRST
-        cached = llm_cache.get(user_role, clean_input)
+        cached = llm_cache.get(user_role, clean_input)  # type: ignore[union-attr]
         if cached:
             audit.log("CACHE_HIT", trace_id, {
                 "role": user_role,
-                "confidence": cached["confidence"],
+                "confidence": cached.get("confidence"),
             })
             return {
                 "answer": cached["answer"],
@@ -419,45 +663,39 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
 
         audit.log("CACHE_MISS", trace_id, {"role": user_role})
 
-        # Retrieval
         docs = build_secure_retriever(user_role, trace_id)(clean_input)
         context = "\n\n".join(d.page_content for d in docs)
 
-        # Sources string for prompt (role-aware, source-aware)
         sources_str = ", ".join(
             sorted(set(d.metadata.get("file_name") for d in docs if d.metadata.get("file_name")))
         ) or "none"
 
-        # Scan context BEFORE LLM
         scan_context_for_credentials(context, trace_id)
 
-        # Generation
         setup = RunnableParallel(
             context=lambda _: context,
             question=RunnablePassthrough(),
             role=lambda _: user_role,
             sources=lambda _: sources_str,
         )
-        chain = setup | secure_prompt | _llm | StrOutputParser()
+
+        chain = setup | secure_prompt | _llm | StrOutputParser()  # type: ignore[arg-type]
         answer = chain.invoke(clean_input)
 
-        # Output guards
         answer = pre_filter_check(answer, trace_id)
         answer = scan_answer_for_sensitive_terms(answer, trace_id)
         answer = model_guard_check(answer, context, trace_id)
 
         confidence = compute_confidence(docs, answer)
 
-        # ✅ Cache only HIGH-confidence answers
         if confidence == "HIGH":
-            llm_cache.set(user_role, clean_input, {
+            llm_cache.set(user_role, clean_input, {  # type: ignore[union-attr]
                 "answer": answer,
                 "confidence": confidence,
             })
             audit.log("CACHE_STORED", trace_id, {
                 "role": user_role,
                 "confidence": confidence,
-                "cache_stats": llm_cache.stats(),
             })
         else:
             audit.log("CACHE_SKIPPED", trace_id, {

@@ -18,6 +18,24 @@ import os
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+# ============================================================
+# DB IMPORTS
+# ============================================================
+
+try:
+    from db.connection import init_db
+    from db.seed import seed_users
+    DB_AVAILABLE = True
+except Exception as e:
+    import traceback as tb
+    print(f"[STARTUP ERROR] Failed to import database modules: {e}")
+    print(tb.format_exc())
+    DB_AVAILABLE = False
+
+# ============================================================
+# AUTH IMPORTS
+# ============================================================
+
 try:
     from app.auth import (
         authenticate_user,
@@ -33,12 +51,15 @@ except Exception as e:
     print(tb.format_exc())
     AUTH_AVAILABLE = False
 
-    # Stub so app can still boot; protected endpoints will return a clear error.
     def get_current_user():  # type: ignore
         raise HTTPException(
             status_code=503,
             detail="Authentication module failed to load; JWT auth is unavailable.",
         )
+
+# ============================================================
+# SECURE RAG IMPORTS
+# ============================================================
 
 from app.secure_rag import (
     detect_prompt_injection,
@@ -62,7 +83,7 @@ from app.secure_rag import (
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 1️⃣ FASTAPI INIT
+# 1️⃣  FASTAPI INIT
 # ============================================================
 
 app = FastAPI(
@@ -72,7 +93,7 @@ app = FastAPI(
 )
 
 # ============================================================
-# 2️⃣ RATE LIMITING
+# 2️⃣  RATE LIMITING
 # ============================================================
 
 limiter = Limiter(key_func=get_remote_address)
@@ -81,7 +102,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # ============================================================
-# 3️⃣ REQUEST MODELS
+# 3️⃣  REQUEST / RESPONSE MODELS
 # ============================================================
 
 class SecureRAGRequest(BaseModel):
@@ -108,7 +129,7 @@ class LoginResponse(BaseModel):
     role: str
 
 # ============================================================
-# 3b️⃣ EVALUATION MODELS
+# 3b️⃣  EVALUATION MODELS
 # ============================================================
 
 class EvalCase(BaseModel):
@@ -144,7 +165,102 @@ def _require_eval_key(x_eval_key: Optional[str]):
         )
 
 # ============================================================
-# 4️⃣ AUTH ENDPOINTS
+# 4️⃣  STARTUP EVENT  ← UPDATED SECTION
+# ============================================================
+
+@app.on_event("startup")
+async def startup():
+
+    # ── Step 1: PostgreSQL — create tables ──────────────────
+    if DB_AVAILABLE:
+        try:
+            await init_db()
+            logger.info(json.dumps({
+                "trace_id": "startup",
+                "event":    "DB_INIT",
+                "status":   "tables_ready",
+            }))
+        except Exception as e:
+            logger.error(json.dumps({
+                "trace_id": "startup",
+                "event":    "DB_INIT_ERROR",
+                "error":    str(e),
+            }))
+    else:
+        logger.warning(json.dumps({
+            "trace_id": "startup",
+            "event":    "DB_INIT_SKIPPED",
+            "reason":   "db module failed to import",
+        }))
+
+    # ── Step 2: PostgreSQL — seed mock users ─────────────────
+    if DB_AVAILABLE:
+        try:
+            await seed_users()
+            logger.info(json.dumps({
+                "trace_id": "startup",
+                "event":    "DB_SEED",
+                "status":   "complete",
+            }))
+        except Exception as e:
+            logger.error(json.dumps({
+                "trace_id": "startup",
+                "event":    "DB_SEED_ERROR",
+                "error":    str(e),
+            }))
+
+    # ── Step 3: Redis cache init ─────────────────────────────
+    try:
+        stats = llm_cache.stats()
+        logger.info(json.dumps({
+            "trace_id": "startup",
+            "event":    "CACHE_INIT",
+            "backend":  stats.get("backend", "unknown"),
+            "ttl_seconds": stats.get("ttl_seconds", "unknown"),
+            "prefix":   stats.get("prefix", "unknown"),
+        }))
+    except Exception as e:
+        logger.error(json.dumps({
+            "trace_id": "startup",
+            "event":    "CACHE_INIT_ERROR",
+            "error":    str(e),
+        }))
+
+    # ── Step 4: FAISS index check ────────────────────────────
+    try:
+        faiss_path = "faiss_index"
+        index_exists = os.path.exists(faiss_path)
+        logger.info(json.dumps({
+            "trace_id":        "startup",
+            "event":           "FAISS_INDEX_CHECK",
+            "index_path":      faiss_path,
+            "exists":          index_exists,
+            "embedding_model": "text-embedding-3-small",
+        }))
+
+        if _vectorstore is not None:
+            ntotal = _vectorstore.index.ntotal if hasattr(_vectorstore, "index") else "unknown"
+            logger.info(json.dumps({
+                "trace_id":   "startup",
+                "event":      "FAISS_INDEX_LOADED",
+                "index_path": faiss_path,
+                "ntotal":     ntotal,
+            }))
+        else:
+            logger.warning(json.dumps({
+                "trace_id": "startup",
+                "event":    "FAISS_INDEX_NOT_LOADED",
+                "reason":   "_vectorstore is None",
+            }))
+    except Exception as e:
+        logger.error(json.dumps({
+            "trace_id": "startup",
+            "event":    "FAISS_INDEX_ERROR",
+            "error":    str(e),
+        }))
+
+# ============================================================
+# 5️⃣  AUTH ENDPOINTS
 # ============================================================
 
 if AUTH_AVAILABLE:
@@ -164,7 +280,7 @@ if AUTH_AVAILABLE:
         if not user:
             audit.log("LOGIN_FAILED", "auth", {
                 "username": form_data.username,
-                "reason": "invalid_credentials",
+                "reason":   "invalid_credentials",
             })
             raise HTTPException(
                 status_code=401,
@@ -175,10 +291,10 @@ if AUTH_AVAILABLE:
         token = create_access_token(user)
 
         audit.log("LOGIN_SUCCESS", "auth", {
-            "user_id": user["user_id"],
+            "user_id":  user["user_id"],
             "username": user["username"],
-            "email": user["email"],
-            "role": user["role"],
+            "email":    user["email"],
+            "role":     user["role"],
         })
 
         return LoginResponse(
@@ -194,9 +310,9 @@ if AUTH_AVAILABLE:
     async def whoami(current_user: dict = Depends(get_current_user)):
         return {
             "user_id": current_user["user_id"],
-            "email": current_user["email"],
-            "role": current_user["role"],
-            "sub": current_user["sub"],
+            "email":   current_user["email"],
+            "role":    current_user["role"],
+            "sub":     current_user["sub"],
         }
 
 else:
@@ -209,7 +325,7 @@ else:
         }
 
 # ============================================================
-# 5️⃣ SECURE RAG ENDPOINT (JWT PROTECTED + STREAMING)
+# 6️⃣  SECURE RAG ENDPOINT (JWT PROTECTED + STREAMING)
 # ============================================================
 
 @app.post(
@@ -232,14 +348,14 @@ async def secure_rag_endpoint(
 ):
     trace_id = new_trace_id()
 
-    user_role = current_user["role"]
-    user_id = current_user["user_id"]
+    user_role  = current_user["role"]
+    user_id    = current_user["user_id"]
     user_email = current_user["email"]
 
     audit.log("REQUEST_START", trace_id, {
-        "user_id": user_id,
-        "email": user_email,
-        "role": user_role,
+        "user_id":          user_id,
+        "email":            user_email,
+        "role":             user_role,
         "question_preview": body.question[:120],
     })
 
@@ -247,46 +363,49 @@ async def secure_rag_endpoint(
         detect_prompt_injection(body.question, trace_id)
         user_input = redact_pii(body.question, trace_id)
 
-        # =====================================================
-        # ✅ FIX #1: Only treat cache as HIT if confidence == HIGH
-        # (If older low-confidence entries exist, bypass and invalidate)
-        # =====================================================
+        # ── Cache lookup (HIGH confidence only) ───────────────
         cached = llm_cache.get(user_role, user_input)
         if cached:
             cached_conf = (cached.get("confidence") or "").upper()
             if cached_conf == "HIGH":
                 audit.log("CACHE_HIT", trace_id, {
-                    "user_id": user_id,
-                    "role": user_role,
+                    "user_id":    user_id,
+                    "role":       user_role,
                     "confidence": cached.get("confidence"),
                 })
 
                 async def stream_cached():
                     for word in cached["answer"].split(" "):
                         yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-                    yield f"data: {json.dumps({'done': True, 'answer': cached['answer'], 'confidence': cached['confidence'], 'cached': True})}\n\n"
+                    yield (
+                        f"data: {json.dumps({'done': True, 'answer': cached['answer'], "
+                        f"'confidence': cached['confidence'], 'cached': True})}\n\n"
+                    )
 
-                return StreamingResponse(stream_cached(), media_type="text/event-stream")
+                return StreamingResponse(
+                    stream_cached(), media_type="text/event-stream"
+                )
 
-            # Cached but LOW/BLOCKED/etc → bypass it
+            # Low/Blocked confidence cached entry → bypass & invalidate
             audit.log("CACHE_BYPASS", trace_id, {
-                "user_id": user_id,
-                "role": user_role,
+                "user_id":    user_id,
+                "role":       user_role,
                 "confidence": cached.get("confidence"),
-                "reason": "cached_confidence_not_high",
+                "reason":     "cached_confidence_not_high",
             })
             llm_cache.invalidate(user_role, user_input)
 
         audit.log("CACHE_MISS", trace_id, {"user_id": user_id, "role": user_role})
 
-        # Retrieval
-        retriever = build_secure_retriever(user_role, trace_id)
+        # ── Retrieval ─────────────────────────────────────────
+        retriever      = build_secure_retriever(user_role, trace_id)
         retrieved_docs = retriever(user_input)
-        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        context        = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-        # Provide role & sources to the prompt (since secure_prompt uses {role} and {sources})
         retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
-        sources_str = ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
+        sources_str = (
+            ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
+        )
 
         setup = RunnableParallel(
             context=lambda _: context,
@@ -306,8 +425,8 @@ async def secure_rag_endpoint(
             except ValueError as ve:
                 audit.log("REQUEST_FAILED", trace_id, {
                     "user_id": user_id,
-                    "error": str(ve),
-                    "stage": "context_scan",
+                    "error":   str(ve),
+                    "stage":   "context_scan",
                 })
                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
                 return
@@ -316,54 +435,52 @@ async def secure_rag_endpoint(
                 full_answer += chunk
                 yield f"data: {json.dumps({'token': chunk})}\n\n"
 
-            # Output guardrails + confidence + caching policy
+            # ── Output guardrails + confidence + cache store ──
             try:
                 full_answer = pre_filter_check(full_answer, trace_id)
                 full_answer = scan_answer_for_sensitive_terms(full_answer, trace_id)
                 full_answer = model_guard_check(full_answer, context, trace_id)
+                confidence  = compute_confidence(retrieved_docs, full_answer)
 
-                confidence = compute_confidence(retrieved_docs, full_answer)
-
-                # =================================================
-                # ✅ FIX #2: Cache ONLY HIGH-confidence answers
-                # =================================================
                 cached_flag = False
                 if confidence == "HIGH":
                     llm_cache.set(user_role, user_input, {
-                        "answer": full_answer,
+                        "answer":     full_answer,
                         "confidence": confidence,
                     })
-                    cached_flag = False  # this response itself wasn't from cache
                     audit.log("CACHE_STORED", trace_id, {
-                        "user_id": user_id,
-                        "role": user_role,
+                        "user_id":    user_id,
+                        "role":       user_role,
                         "confidence": confidence,
                     })
                 else:
                     audit.log("CACHE_SKIPPED", trace_id, {
-                        "user_id": user_id,
-                        "role": user_role,
+                        "user_id":    user_id,
+                        "role":       user_role,
                         "confidence": confidence,
-                        "reason": "low_confidence",
+                        "reason":     "low_confidence",
                     })
 
                 audit.log("ANSWER", trace_id, {
-                    "user_id": user_id,
-                    "email": user_email,
-                    "role": user_role,
-                    "message": full_answer[:500],
+                    "user_id":    user_id,
+                    "email":      user_email,
+                    "role":       user_role,
+                    "message":    full_answer[:500],
                     "confidence": confidence,
-                    "cached": cached_flag,
-                    "sources": retrieved_sources,
+                    "cached":     cached_flag,
+                    "sources":    retrieved_sources,
                 })
 
-                yield f"data: {json.dumps({'done': True, 'answer': full_answer, 'confidence': confidence, 'cached': False})}\n\n"
+                yield (
+                    f"data: {json.dumps({'done': True, 'answer': full_answer, "
+                    f"'confidence': confidence, 'cached': False})}\n\n"
+                )
 
             except ValueError as ve:
                 audit.log("REQUEST_FAILED", trace_id, {
                     "user_id": user_id,
-                    "error": str(ve),
-                    "stage": "output_guard",
+                    "error":   str(ve),
+                    "stage":   "output_guard",
                 })
                 yield f"data: {json.dumps({'error': str(ve)})}\n\n"
 
@@ -372,22 +489,22 @@ async def secure_rag_endpoint(
     except ValueError as ve:
         audit.log("REQUEST_FAILED", trace_id, {
             "user_id": user_id,
-            "error": str(ve),
-            "stage": "input_guard",
+            "error":   str(ve),
+            "stage":   "input_guard",
         })
         raise HTTPException(status_code=400, detail=str(ve))
 
     except Exception as e:
         audit.log("REQUEST_FAILED", trace_id, {
             "user_id": user_id,
-            "error": str(e),
-            "stage": "unhandled",
+            "error":   str(e),
+            "stage":   "unhandled",
         })
         logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 # ============================================================
-# 6️⃣ EVALUATION ENDPOINT
+# 7️⃣  EVALUATION ENDPOINT
 # ============================================================
 
 @app.post("/secure-rag/eval", tags=["Internal"])
@@ -403,38 +520,42 @@ async def secure_rag_eval(
     audit.log("EVAL_BATCH_START", batch_id, {"total_cases": len(body.cases)})
 
     results = []
-    passed = 0
+    passed  = 0
 
     for i, case in enumerate(body.cases):
         case_trace_id = new_trace_id()
-        case_id = case.id or f"case_{i + 1}"
+        case_id       = case.id or f"case_{i + 1}"
 
         audit.log("EVAL_CASE_START", case_trace_id, {
-            "batch_id": batch_id,
-            "case_id": case_id,
-            "role": case.role,
-            "should_block": case.should_block,
+            "batch_id":        batch_id,
+            "case_id":         case_id,
+            "role":            case.role,
+            "should_block":    case.should_block,
             "question_preview": case.question[:120],
         })
 
-        answer = None
-        confidence = None
+        answer            = None
+        confidence        = None
         retrieved_sources = []
-        blocked = False
-        error_msg = None
+        blocked           = False
+        error_msg         = None
 
         try:
             detect_prompt_injection(case.question, case_trace_id)
             clean_input = redact_pii(case.question, case_trace_id)
 
-            retriever = build_secure_retriever(case.role, case_trace_id)
+            retriever      = build_secure_retriever(case.role, case_trace_id)
             retrieved_docs = retriever(clean_input)
-            retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
+            retrieved_sources = [
+                d.metadata.get("file_name") for d in retrieved_docs
+            ]
             context = "\n\n".join(d.page_content for d in retrieved_docs)
 
             scan_context_for_credentials(context, case_trace_id)
 
-            sources_str = ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
+            sources_str = (
+                ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
+            )
 
             setup = RunnableParallel(
                 context=lambda _: context,
@@ -443,24 +564,30 @@ async def secure_rag_eval(
                 sources=lambda _: sources_str,
             )
             rag_chain = setup | secure_prompt | _llm | StrOutputParser()
-            answer = await rag_chain.ainvoke(clean_input)
+            answer    = await rag_chain.ainvoke(clean_input)
 
-            answer = pre_filter_check(answer, case_trace_id)
-            answer = scan_answer_for_sensitive_terms(answer, case_trace_id)
-            answer = model_guard_check(answer, context, case_trace_id)
+            answer     = pre_filter_check(answer, case_trace_id)
+            answer     = scan_answer_for_sensitive_terms(answer, case_trace_id)
+            answer     = model_guard_check(answer, context, case_trace_id)
             confidence = compute_confidence(retrieved_docs, answer)
 
         except Exception as e:
-            blocked = True
+            blocked   = True
             error_msg = str(e)
             confidence = "BLOCKED"
 
         checks = {}
         checks["block_check"] = (blocked == case.should_block)
-        checks["confidence_check"] = (confidence == case.expect_confidence) if case.expect_confidence else True
+        checks["confidence_check"] = (
+            (confidence == case.expect_confidence)
+            if case.expect_confidence else True
+        )
 
         if case.expect_answer_contains and answer:
-            checks["answer_content_check"] = all(kw.lower() in answer.lower() for kw in case.expect_answer_contains)
+            checks["answer_content_check"] = all(
+                kw.lower() in answer.lower()
+                for kw in case.expect_answer_contains
+            )
         elif case.expect_answer_contains and not answer:
             checks["answer_content_check"] = False
         else:
@@ -476,26 +603,26 @@ async def secure_rag_eval(
             passed += 1
 
         audit.log("EVAL_CASE_RESULT", case_trace_id, {
-            "batch_id": batch_id,
-            "case_id": case_id,
-            "passed": case_passed,
-            "blocked": blocked,
+            "batch_id":   batch_id,
+            "case_id":    case_id,
+            "passed":     case_passed,
+            "blocked":    blocked,
             "confidence": confidence,
-            "checks": checks,
-            "sources": retrieved_sources,
-            "error": error_msg,
+            "checks":     checks,
+            "sources":    retrieved_sources,
+            "error":      error_msg,
         })
 
         result = {
-            "case_id": case_id,
-            "trace_id": case_trace_id,
-            "role": case.role,
-            "question": case.question,
-            "passed": case_passed,
-            "blocked": blocked,
+            "case_id":    case_id,
+            "trace_id":   case_trace_id,
+            "role":       case.role,
+            "question":   case.question,
+            "passed":     case_passed,
+            "blocked":    blocked,
             "confidence": confidence,
-            "checks": checks,
-            "error": error_msg,
+            "checks":     checks,
+            "error":      error_msg,
         }
         if body.include_sources:
             result["sources"] = retrieved_sources
@@ -504,28 +631,28 @@ async def secure_rag_eval(
 
         results.append(result)
 
-    total = len(body.cases)
+    total     = len(body.cases)
     pass_rate = round((passed / total) * 100, 1) if total > 0 else 0.0
 
     summary = {
-        "batch_id": batch_id,
-        "total": total,
-        "passed": passed,
-        "failed": total - passed,
+        "batch_id":      batch_id,
+        "total":         total,
+        "passed":        passed,
+        "failed":        total - passed,
         "pass_rate_pct": pass_rate,
-        "results": results,
+        "results":       results,
     }
 
     audit.log("EVAL_BATCH_DONE", batch_id, {
-        "total": total,
-        "passed": passed,
-        "failed": total - passed,
+        "total":         total,
+        "passed":        passed,
+        "failed":        total - passed,
         "pass_rate_pct": pass_rate,
     })
     return summary
 
 # ============================================================
-# 7️⃣ CACHE ENDPOINTS
+# 8️⃣  CACHE ENDPOINTS
 # ============================================================
 
 @app.get("/secure-rag/cache/stats", tags=["Internal"])
@@ -547,28 +674,44 @@ async def cache_clear(
     return {"status": "cleared", "entries_removed": cleared}
 
 # ============================================================
-# 8️⃣ HEALTH CHECKS
+# 9️⃣  HEALTH CHECKS
 # ============================================================
 
 @app.get("/", tags=["Health"])
 def health():
     return {
-        "status": "ok",
-        "service": "Tech Secure RAG",
-        "version": "3.0.0",
-        "auth_loaded": AUTH_AVAILABLE,
-        "endpoint": "/secure-rag/invoke",
+        "status":       "ok",
+        "service":      "Tech Secure RAG",
+        "version":      "3.0.0",
+        "auth_loaded":  AUTH_AVAILABLE,
+        "db_loaded":    DB_AVAILABLE,
+        "endpoint":     "/secure-rag/invoke",
     }
 
 @app.get("/health", tags=["Health"])
 async def health_check():
     health_status = {
-        "status": "ok",
-        "service": "Tech Secure RAG",
-        "version": "3.0.0",
+        "status":     "ok",
+        "service":    "Tech Secure RAG",
+        "version":    "3.0.0",
         "components": {},
     }
 
+    # ── PostgreSQL ────────────────────────────────────────────
+    if DB_AVAILABLE:
+        try:
+            from db.connection import engine
+            async with engine.connect() as conn:
+                await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+            health_status["components"]["postgresql"] = "healthy"
+        except Exception as e:
+            health_status["components"]["postgresql"] = f"error: {str(e)}"
+            health_status["status"] = "degraded"
+    else:
+        health_status["components"]["postgresql"] = "not_loaded"
+        health_status["status"] = "degraded"
+
+    # ── FAISS ─────────────────────────────────────────────────
     try:
         if _vectorstore is not None:
             _ = _vectorstore.similarity_search("test", k=1)
@@ -580,6 +723,7 @@ async def health_check():
         health_status["components"]["faiss"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
+    # ── Embeddings ────────────────────────────────────────────
     try:
         _embeddings.embed_query("health check")
         health_status["components"]["embeddings"] = "healthy"
@@ -587,6 +731,7 @@ async def health_check():
         health_status["components"]["embeddings"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
+    # ── LLM ───────────────────────────────────────────────────
     try:
         _llm.invoke("ping")
         health_status["components"]["llm"] = "healthy"
@@ -594,10 +739,24 @@ async def health_check():
         health_status["components"]["llm"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
+    # ── Redis Cache ───────────────────────────────────────────
+    try:
+        stats = llm_cache.stats()
+        health_status["components"]["redis"] = (
+            "healthy" if stats.get("backend") == "redis" else "fallback"
+        )
+    except Exception as e:
+        health_status["components"]["redis"] = f"error: {str(e)}"
+        health_status["status"] = "degraded"
+
     if all(v == "healthy" for v in health_status["components"].values()):
         health_status["status"] = "healthy"
 
     return health_status
+
+# ============================================================
+# 🔟  ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
     import uvicorn

@@ -165,13 +165,13 @@ def _require_eval_key(x_eval_key: Optional[str]):
         )
 
 # ============================================================
-# 4️⃣  STARTUP EVENT  ← UPDATED SECTION
+# 4️⃣  STARTUP EVENT
 # ============================================================
 
 @app.on_event("startup")
 async def startup():
 
-    # ── Step 1: PostgreSQL — create tables ──────────────────
+    # ── Step 1: PostgreSQL — create tables ───────────────────
     if DB_AVAILABLE:
         try:
             await init_db()
@@ -209,15 +209,15 @@ async def startup():
                 "error":    str(e),
             }))
 
-    # ── Step 3: Redis cache init ─────────────────────────────
+    # ── Step 3: Redis cache init ──────────────────────────────
     try:
         stats = llm_cache.stats()
         logger.info(json.dumps({
-            "trace_id": "startup",
-            "event":    "CACHE_INIT",
-            "backend":  stats.get("backend", "unknown"),
+            "trace_id":    "startup",
+            "event":       "CACHE_INIT",
+            "backend":     stats.get("backend", "unknown"),
             "ttl_seconds": stats.get("ttl_seconds", "unknown"),
-            "prefix":   stats.get("prefix", "unknown"),
+            "prefix":      stats.get("prefix", "unknown"),
         }))
     except Exception as e:
         logger.error(json.dumps({
@@ -226,9 +226,9 @@ async def startup():
             "error":    str(e),
         }))
 
-    # ── Step 4: FAISS index check ────────────────────────────
+    # ── Step 4: FAISS index check ─────────────────────────────
     try:
-        faiss_path = "faiss_index"
+        faiss_path   = "faiss_index"
         index_exists = os.path.exists(faiss_path)
         logger.info(json.dumps({
             "trace_id":        "startup",
@@ -239,7 +239,11 @@ async def startup():
         }))
 
         if _vectorstore is not None:
-            ntotal = _vectorstore.index.ntotal if hasattr(_vectorstore, "index") else "unknown"
+            ntotal = (
+                _vectorstore.index.ntotal
+                if hasattr(_vectorstore, "index")
+                else "unknown"
+            )
             logger.info(json.dumps({
                 "trace_id":   "startup",
                 "event":      "FAISS_INDEX_LOADED",
@@ -374,13 +378,18 @@ async def secure_rag_endpoint(
                     "confidence": cached.get("confidence"),
                 })
 
+                # ✅ FIX 1: dicts built before json.dumps — no nested quotes
                 async def stream_cached():
                     for word in cached["answer"].split(" "):
-                        yield f"data: {json.dumps({'token': word + ' '})}\n\n"
-                    yield (
-                        f"data: {json.dumps({'done': True, 'answer': cached['answer'], "
-                        f"'confidence': cached['confidence'], 'cached': True})}\n\n"
-                    )
+                        token_payload = {"token": word + " "}
+                        yield f"data: {json.dumps(token_payload)}\n\n"
+                    done_payload = {
+                        "done":       True,
+                        "answer":     cached["answer"],
+                        "confidence": cached["confidence"],
+                        "cached":     True,
+                    }
+                    yield f"data: {json.dumps(done_payload)}\n\n"
 
                 return StreamingResponse(
                     stream_cached(), media_type="text/event-stream"
@@ -428,12 +437,14 @@ async def secure_rag_endpoint(
                     "error":   str(ve),
                     "stage":   "context_scan",
                 })
-                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
+                error_payload = {"error": str(ve)}
+                yield f"data: {json.dumps(error_payload)}\n\n"
                 return
 
             async for chunk in rag_chain.astream(user_input):
                 full_answer += chunk
-                yield f"data: {json.dumps({'token': chunk})}\n\n"
+                token_payload = {"token": chunk}
+                yield f"data: {json.dumps(token_payload)}\n\n"
 
             # ── Output guardrails + confidence + cache store ──
             try:
@@ -471,10 +482,14 @@ async def secure_rag_endpoint(
                     "sources":    retrieved_sources,
                 })
 
-                yield (
-                    f"data: {json.dumps({'done': True, 'answer': full_answer, "
-                    f"'confidence': confidence, 'cached': False})}\n\n"
-                )
+                # ✅ FIX 2: dict built before json.dumps — no nested quotes
+                done_payload = {
+                    "done":       True,
+                    "answer":     full_answer,
+                    "confidence": confidence,
+                    "cached":     False,
+                }
+                yield f"data: {json.dumps(done_payload)}\n\n"
 
             except ValueError as ve:
                 audit.log("REQUEST_FAILED", trace_id, {
@@ -482,7 +497,8 @@ async def secure_rag_endpoint(
                     "error":   str(ve),
                     "stage":   "output_guard",
                 })
-                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
+                error_payload = {"error": str(ve)}
+                yield f"data: {json.dumps(error_payload)}\n\n"
 
         return StreamingResponse(stream_tokens(), media_type="text/event-stream")
 
@@ -527,10 +543,10 @@ async def secure_rag_eval(
         case_id       = case.id or f"case_{i + 1}"
 
         audit.log("EVAL_CASE_START", case_trace_id, {
-            "batch_id":        batch_id,
-            "case_id":         case_id,
-            "role":            case.role,
-            "should_block":    case.should_block,
+            "batch_id":         batch_id,
+            "case_id":          case_id,
+            "role":             case.role,
+            "should_block":     case.should_block,
             "question_preview": case.question[:120],
         })
 
@@ -572,8 +588,8 @@ async def secure_rag_eval(
             confidence = compute_confidence(retrieved_docs, answer)
 
         except Exception as e:
-            blocked   = True
-            error_msg = str(e)
+            blocked    = True
+            error_msg  = str(e)
             confidence = "BLOCKED"
 
         checks = {}
@@ -680,12 +696,12 @@ async def cache_clear(
 @app.get("/", tags=["Health"])
 def health():
     return {
-        "status":       "ok",
-        "service":      "Tech Secure RAG",
-        "version":      "3.0.0",
-        "auth_loaded":  AUTH_AVAILABLE,
-        "db_loaded":    DB_AVAILABLE,
-        "endpoint":     "/secure-rag/invoke",
+        "status":      "ok",
+        "service":     "Tech Secure RAG",
+        "version":     "3.0.0",
+        "auth_loaded": AUTH_AVAILABLE,
+        "db_loaded":   DB_AVAILABLE,
+        "endpoint":    "/secure-rag/invoke",
     }
 
 @app.get("/health", tags=["Health"])
@@ -701,8 +717,9 @@ async def health_check():
     if DB_AVAILABLE:
         try:
             from db.connection import engine
+            import sqlalchemy
             async with engine.connect() as conn:
-                await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+                await conn.execute(sqlalchemy.text("SELECT 1"))
             health_status["components"]["postgresql"] = "healthy"
         except Exception as e:
             health_status["components"]["postgresql"] = f"error: {str(e)}"

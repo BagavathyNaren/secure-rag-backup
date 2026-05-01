@@ -7,7 +7,8 @@ import sys
 
 from alembic import context
 from logging.config import fileConfig
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 logger = logging.getLogger("alembic.env")
 
@@ -15,13 +16,11 @@ _SECRET_RE = re.compile(r"(?<=://)[^:]+:[^@]+(?=@)")
 
 
 def _mask_url(url: str) -> str:
+    """Mask credentials in DATABASE_URL for safe logging."""
     return _SECRET_RE.sub("***", url)
 
 
-# ── sys.path: ensure /app is resolvable regardless of how Alembic is invoked ──
-# upgrade_head() in db/migrations.py calls alembic programmatically, which
-# changes the working directory.  Anchoring to this file's grandparent
-# (/app/alembic/../  →  /app/) keeps all imports stable.
+# ── Make sure /app is importable ──────────────────────────────────────────────
 _APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
@@ -32,24 +31,32 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Inject DATABASE_URL — raw value goes to Alembic internals only, never logged
+# Get and store the raw URL (used internally by Alembic, never logged raw)
 _raw_url = os.getenv("DATABASE_URL", "").strip()
 if not _raw_url:
     raise RuntimeError("DATABASE_URL is not set — Alembic cannot continue.")
 
-config.set_main_option("sqlalchemy.url", _raw_url)
-logger.info("Alembic targeting: %s", _mask_url(_raw_url))   # ✅ masked
+# Normalize to asyncpg driver (consistent with db/connection.py)
+if _raw_url.startswith("postgresql://"):
+    _raw_url = _raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+elif _raw_url.startswith("postgres://"):
+    _raw_url = _raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-# ── metadata ──────────────────────────────────────────────────────────────────
-# Base lives in models/database.py  (not db/base.py or app/db.py)
-from models.database import Base          # noqa: E402
+config.set_main_option("sqlalchemy.url", _raw_url)
+
+# ✅ Only masked URL is ever logged
+logger.info("Alembic targeting: %s", _mask_url(_raw_url))
+
+# ── Metadata ──────────────────────────────────────────────────────────────────
+from models.database import Base
 target_metadata = Base.metadata
 
 
-# ── runners ───────────────────────────────────────────────────────────────────
+# ── Async migration runner ────────────────────────────────────────────────────
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
-    logger.info("Offline mode → %s", _mask_url(url))   # ✅ masked
+    logger.info("Offline mode → %s", _mask_url(url))
+
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -60,26 +67,27 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    cfg = config.get_section(config.config_ini_section, {})
-    connectable = engine_from_config(
-        cfg,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-        echo=False,      # ← must stay False; echo=True leaks credentials
-    )
-    logger.info("Online migration engine ready.")   # no URL here
+async def run_migrations_online() -> None:
+    """Run migrations using async engine (no psycopg2 required)."""
+    url = config.get_main_option("sqlalchemy.url")
 
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-        )
+    connectable = create_async_engine(
+        url,
+        poolclass=NullPool,
+        echo=False,  # Never echo the connection string
+    )
+
+    def do_run_migrations(connection):
+        context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
             context.run_migrations()
+
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
 
 
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    run_migrations_online()
+    import asyncio
+    asyncio.run(run_migrations_online())

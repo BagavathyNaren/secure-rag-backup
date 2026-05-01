@@ -2,7 +2,6 @@
 import logging
 import os
 import re
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import event
@@ -20,26 +19,18 @@ def _normalize_asyncpg_url(url: str) -> str:
     """
     Convert DATABASE_URL to asyncpg format:
     1. postgresql:// → postgresql+asyncpg://
-    2. Strip ?sslmode= (asyncpg doesn't recognize it)
+    2. Strip ALL query parameters (sslmode, channel_binding, etc.)
     """
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    query_params.pop("sslmode", None)  # Remove sslmode
+    # Strip query params — asyncpg handles SSL via connect_args
+    if "?" in url:
+        url = url.split("?")[0]
 
-    new_query = urlencode(query_params, doseq=True)
-    return urlunparse((
-        parsed.scheme,
-        parsed.netloc,
-        parsed.path,
-        parsed.params,
-        new_query,
-        parsed.fragment,
-    ))
+    return url
 
 
 def _get_async_database_url() -> str:
@@ -54,11 +45,11 @@ _async_url = _get_async_database_url()
 # ── engine ────────────────────────────────────────────────────────────────────
 engine = create_async_engine(
     _async_url,
-    echo=False,        # ← must stay False to prevent credential leaks
+    echo=False,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,
-    connect_args={"ssl": "require"},  # ← asyncpg SSL param
+    connect_args={"ssl": "require"},  # ← asyncpg SSL parameter
 )
 
 # ── safe connect-event log ────────────────────────────────────────────────────
@@ -76,6 +67,5 @@ AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
 
 
 async def get_db():
-    """FastAPI dependency — yields a scoped async DB session."""
     async with AsyncSessionLocal() as session:
         yield session

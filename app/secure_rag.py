@@ -57,14 +57,17 @@ def log_event(event_type: str, data):
 # ✅ LLM ANSWER CACHE
 # ============================================================
 
-class LLMCache:
-    """
-    In-memory TTL cache for LLM answers.
+# ============================================================
+# ✅ LLM ANSWER CACHE (Redis if available, else in-memory fallback)
+# ============================================================
 
-    Key   : SHA256(role + "|" + normalized_question)
-    Value : {"answer": str, "confidence": str}
-    TTL   : 300 seconds (5 minutes) by default
-    Max   : 200 entries — FIFO eviction when full
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_TTL_SECONDS = int(os.getenv("REDIS_TTL_SECONDS", "300"))
+REDIS_PREFIX = os.getenv("REDIS_PREFIX", "secure_rag:cache:v1:")
+
+class InMemoryLLMCache:
+    """
+    In-memory TTL cache (fallback). Same interface as RedisLLMCache.
     """
     def __init__(self, ttl_seconds: int = 300, max_entries: int = 200):
         self._store: Dict[str, dict] = {}
@@ -92,24 +95,22 @@ class LLMCache:
             del self._store[oldest_key]
 
         key = self._make_key(role, question)
-        self._store[key] = {
-            "value": value,
-            "expires_at": time.monotonic() + self._ttl,
-        }
+        self._store[key] = {"value": value, "expires_at": time.monotonic() + self._ttl}
 
     def invalidate(self, role: str, question: str) -> None:
         self._store.pop(self._make_key(role, question), None)
 
     def clear(self) -> int:
-        count = len(self._store)
+        n = len(self._store)
         self._store.clear()
-        return count
+        return n
 
     def stats(self) -> dict:
         now = time.monotonic()
         active = sum(1 for e in self._store.values() if e["expires_at"] > now)
         expired = len(self._store) - active
         return {
+            "backend": "memory",
             "total_entries": len(self._store),
             "active_entries": active,
             "expired_entries": expired,
@@ -118,11 +119,120 @@ class LLMCache:
         }
 
 
-# Global cache instance
-llm_cache = LLMCache(ttl_seconds=300, max_entries=200)
+class RedisLLMCache:
+    """
+    Redis TTL cache. Same interface as InMemoryLLMCache.
 
-audit.log("CACHE_INIT", "startup", {"ttl_seconds": 300, "max_entries": 200})
+    Keys:  <REDIS_PREFIX><sha256(role|question)>
+    Value: JSON string {"answer": "...", "confidence": "HIGH"}
+    TTL:   redis expire (seconds)
+    """
+    def __init__(self, redis_url: str, ttl_seconds: int, prefix: str):
+        import redis  # requires redis==5.x
 
+        self._ttl = ttl_seconds
+        self._prefix = prefix
+
+        # short timeouts so Redis issues don't hang your app
+        self._client = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+            health_check_interval=30,
+        )
+
+        # verify connectivity (fail fast -> fallback)
+        self._client.ping()
+
+    def _make_key(self, role: str, question: str) -> str:
+        normalized = question.strip().lower()
+        raw = f"{role}|{normalized}"
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        return f"{self._prefix}{digest}"
+
+    def get(self, role: str, question: str) -> Optional[dict]:
+        key = self._make_key(role, question)
+        raw = self._client.get(key)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            # bad/corrupted entry -> delete it
+            self._client.delete(key)
+            return None
+
+    def set(self, role: str, question: str, value: dict) -> None:
+        key = self._make_key(role, question)
+        self._client.setex(key, self._ttl, json.dumps(value))
+
+    def invalidate(self, role: str, question: str) -> None:
+        key = self._make_key(role, question)
+        self._client.delete(key)
+
+    def clear(self) -> int:
+        # delete all keys for this prefix using SCAN (safe)
+        pattern = f"{self._prefix}*"
+        deleted = 0
+        pipe = self._client.pipeline(transaction=False)
+
+        batch = 0
+        for k in self._client.scan_iter(match=pattern, count=500):
+            pipe.delete(k)
+            batch += 1
+            if batch >= 500:
+                deleted += sum(pipe.execute())
+                batch = 0
+
+        if batch:
+            deleted += sum(pipe.execute())
+
+        return int(deleted)
+
+    def stats(self) -> dict:
+        # Approx: count keys with prefix via SCAN (bounded)
+        pattern = f"{self._prefix}*"
+        count = 0
+        for _ in self._client.scan_iter(match=pattern, count=500):
+            count += 1
+            if count >= 5000:  # safety cap
+                break
+
+        return {
+            "backend": "redis",
+            "prefix": self._prefix,
+            "ttl_seconds": self._ttl,
+            "approx_entries": count,
+        }
+
+
+# Instantiate cache backend
+try:
+    if REDIS_URL:
+        llm_cache = RedisLLMCache(REDIS_URL, REDIS_TTL_SECONDS, REDIS_PREFIX)
+        audit.log("CACHE_INIT", "startup", {
+            "backend": "redis",
+            "ttl_seconds": REDIS_TTL_SECONDS,
+            "prefix": REDIS_PREFIX,
+        })
+    else:
+        llm_cache = InMemoryLLMCache(ttl_seconds=REDIS_TTL_SECONDS, max_entries=200)
+        audit.log("CACHE_INIT", "startup", {
+            "backend": "memory",
+            "ttl_seconds": REDIS_TTL_SECONDS,
+            "max_entries": 200,
+        })
+except Exception as e:
+    # Redis configured but unreachable -> fallback to memory (do not crash app)
+    llm_cache = InMemoryLLMCache(ttl_seconds=REDIS_TTL_SECONDS, max_entries=200)
+    audit.log("CACHE_INIT_FALLBACK", "startup", {
+        "backend": "memory",
+        "reason": "redis_unavailable",
+        "error": str(e),
+        "ttl_seconds": REDIS_TTL_SECONDS,
+        "max_entries": 200,
+    })
 
 # ============================================================
 # NUCLEAR BLOCKS

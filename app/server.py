@@ -58,27 +58,10 @@ except Exception as e:
         )
 
 # ============================================================
-# SECURE RAG IMPORTS
+# SECURE RAG MODULE (production refactor: init happens in startup)
 # ============================================================
 
-from app.secure_rag import (
-    detect_prompt_injection,
-    redact_pii,
-    build_secure_retriever,
-    secure_prompt,
-    _llm,
-    model_guard_check,
-    compute_confidence,
-    scan_context_for_credentials,
-    scan_answer_for_sensitive_terms,
-    pre_filter_check,
-    log_event,
-    audit,
-    new_trace_id,
-    llm_cache,
-    _vectorstore,
-    _embeddings,
-)
+import app.secure_rag as rag
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +93,7 @@ class SecureRAGRequest(BaseModel):
 
     class Config:
         json_schema_extra = {
-            "example": {
-                "question": "What is the minimum password length?"
-            }
+            "example": {"question": "What is the minimum password length?"}
         }
 
 class SecureRAGResponse(BaseModel):
@@ -165,42 +146,49 @@ def _require_eval_key(x_eval_key: Optional[str]):
         )
 
 # ============================================================
-# 4️⃣  STARTUP EVENT
+# 4️⃣  STARTUP EVENT (single unified startup log sequence)
 # ============================================================
 
 @app.on_event("startup")
 async def startup():
-    from datetime import datetime, timezone
-
-    def _ts():
-        # Produce "Z" style timestamps like your other logs
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    def _log(event: str, **kwargs):
-        print(json.dumps({
-            "timestamp": _ts(),
-            "trace_id": "startup",
-            "event": event,
-            **kwargs,
-        }), flush=True)
-
-    # 1) Create tables
+    # 1) PostgreSQL init + seed
     if DB_AVAILABLE:
         try:
             await init_db()
-            _log("DB_INIT", status="tables_ready")
+            rag.audit.log("DB_INIT", "startup", {"status": "tables_ready"})
         except Exception as e:
-            _log("DB_INIT_ERROR", error=str(e))
-    else:
-        _log("DB_INIT_SKIPPED", reason="db module failed to import")
+            rag.audit.log("DB_INIT_ERROR", "startup", {"error": str(e)})
 
-    # 2) Seed users
-    if DB_AVAILABLE:
         try:
             await seed_users()
-            _log("DB_SEED", status="complete")
+            rag.audit.log("DB_SEED", "startup", {"status": "complete"})
         except Exception as e:
-            _log("DB_SEED_ERROR", error=str(e))
+            rag.audit.log("DB_SEED_ERROR", "startup", {"error": str(e)})
+    else:
+        rag.audit.log("DB_INIT_SKIPPED", "startup", {"reason": "db module failed to import"})
+
+    # 2) Cache init (Redis if available else memory)
+    rag.init_cache()
+
+    # 3) Vectorstore init (FAISS load/build)
+    force_rebuild = os.getenv("REBUILD_FAISS", "0").strip() == "1"
+    rag.init_vectorstore(force_rebuild=force_rebuild)
+
+    # 4) LLM init
+    rag.init_llm()
+
+    rag.audit.log("STARTUP_COMPLETE", "startup", {"status": "ready"})
+
+def _require_rag_ready():
+    """
+    Defensive check: if startup hasn't completed, block requests with 503.
+    """
+    if rag.llm_cache is None or rag._vectorstore is None or rag._embeddings is None or rag._llm is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Service initializing. Please retry in a few seconds.",
+        )
+
 # ============================================================
 # 5️⃣  AUTH ENDPOINTS
 # ============================================================
@@ -220,9 +208,9 @@ if AUTH_AVAILABLE:
         """
         user = authenticate_user(form_data.username, form_data.password)
         if not user:
-            audit.log("LOGIN_FAILED", "auth", {
+            rag.audit.log("LOGIN_FAILED", "auth", {
                 "username": form_data.username,
-                "reason":   "invalid_credentials",
+                "reason": "invalid_credentials",
             })
             raise HTTPException(
                 status_code=401,
@@ -232,11 +220,11 @@ if AUTH_AVAILABLE:
 
         token = create_access_token(user)
 
-        audit.log("LOGIN_SUCCESS", "auth", {
-            "user_id":  user["user_id"],
+        rag.audit.log("LOGIN_SUCCESS", "auth", {
+            "user_id": user["user_id"],
             "username": user["username"],
-            "email":    user["email"],
-            "role":     user["role"],
+            "email": user["email"],
+            "role": user["role"],
         })
 
         return LoginResponse(
@@ -252,19 +240,16 @@ if AUTH_AVAILABLE:
     async def whoami(current_user: dict = Depends(get_current_user)):
         return {
             "user_id": current_user["user_id"],
-            "email":   current_user["email"],
-            "role":    current_user["role"],
-            "sub":     current_user["sub"],
+            "email": current_user["email"],
+            "role": current_user["role"],
+            "sub": current_user["sub"],
         }
 
 else:
 
     @app.get("/auth/status", tags=["Authentication"])
     async def auth_status():
-        return {
-            "status": "AUTH_MODULE_FAILED_TO_LOAD",
-            "detail": "Check container logs for the real error.",
-        }
+        return {"status": "AUTH_MODULE_FAILED_TO_LOAD", "detail": "Check container logs for the real error."}
 
 # ============================================================
 # 6️⃣  SECURE RAG ENDPOINT (JWT PROTECTED + STREAMING)
@@ -288,71 +273,67 @@ async def secure_rag_endpoint(
     body: SecureRAGRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    trace_id = new_trace_id()
+    _require_rag_ready()
 
-    user_role  = current_user["role"]
-    user_id    = current_user["user_id"]
+    trace_id = rag.new_trace_id()
+
+    user_role = current_user["role"]
+    user_id = current_user["user_id"]
     user_email = current_user["email"]
 
-    audit.log("REQUEST_START", trace_id, {
-        "user_id":          user_id,
-        "email":            user_email,
-        "role":             user_role,
+    rag.audit.log("REQUEST_START", trace_id, {
+        "user_id": user_id,
+        "email": user_email,
+        "role": user_role,
         "question_preview": body.question[:120],
     })
 
     try:
-        detect_prompt_injection(body.question, trace_id)
-        user_input = redact_pii(body.question, trace_id)
+        rag.detect_prompt_injection(body.question, trace_id)
+        user_input = rag.redact_pii(body.question, trace_id)
 
-        # ── Cache lookup (HIGH confidence only) ───────────────
-        cached = llm_cache.get(user_role, user_input)
+        # Cache lookup (HIGH confidence only)
+        cached = rag.llm_cache.get(user_role, user_input)  # type: ignore[union-attr]
         if cached:
             cached_conf = (cached.get("confidence") or "").upper()
             if cached_conf == "HIGH":
-                audit.log("CACHE_HIT", trace_id, {
-                    "user_id":    user_id,
-                    "role":       user_role,
+                rag.audit.log("CACHE_HIT", trace_id, {
+                    "user_id": user_id,
+                    "role": user_role,
                     "confidence": cached.get("confidence"),
                 })
 
-                # ✅ FIX 1: dicts built before json.dumps — no nested quotes
                 async def stream_cached():
                     for word in cached["answer"].split(" "):
                         token_payload = {"token": word + " "}
                         yield f"data: {json.dumps(token_payload)}\n\n"
                     done_payload = {
-                        "done":       True,
-                        "answer":     cached["answer"],
+                        "done": True,
+                        "answer": cached["answer"],
                         "confidence": cached["confidence"],
-                        "cached":     True,
+                        "cached": True,
                     }
                     yield f"data: {json.dumps(done_payload)}\n\n"
 
-                return StreamingResponse(
-                    stream_cached(), media_type="text/event-stream"
-                )
+                return StreamingResponse(stream_cached(), media_type="text/event-stream")
 
-            # Low/Blocked confidence cached entry → bypass & invalidate
-            audit.log("CACHE_BYPASS", trace_id, {
-                "user_id":    user_id,
-                "role":       user_role,
+            rag.audit.log("CACHE_BYPASS", trace_id, {
+                "user_id": user_id,
+                "role": user_role,
                 "confidence": cached.get("confidence"),
-                "reason":     "cached_confidence_not_high",
+                "reason": "cached_confidence_not_high",
             })
-            llm_cache.invalidate(user_role, user_input)
+            rag.llm_cache.invalidate(user_role, user_input)  # type: ignore[union-attr]
 
-        audit.log("CACHE_MISS", trace_id, {"user_id": user_id, "role": user_role})
+        rag.audit.log("CACHE_MISS", trace_id, {"user_id": user_id, "role": user_role})
 
-        # ── Retrieval ─────────────────────────────────────────
-        retriever      = build_secure_retriever(user_role, trace_id)
+        # Retrieval
+        retriever = rag.build_secure_retriever(user_role, trace_id)
         retrieved_docs = retriever(user_input)
-        context        = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
         retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
-        sources_str = (
-            ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
-        )
+        sources_str = ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
 
         setup = RunnableParallel(
             context=lambda _: context,
@@ -361,98 +342,94 @@ async def secure_rag_endpoint(
             sources=lambda _: sources_str,
         )
 
-        rag_chain = setup | secure_prompt | _llm | StrOutputParser()
+        rag_chain = setup | rag.secure_prompt | rag._llm | StrOutputParser()
 
         async def stream_tokens():
             full_answer = ""
 
             # Block before generation if context contains credentials
             try:
-                scan_context_for_credentials(context, trace_id)
+                rag.scan_context_for_credentials(context, trace_id)
             except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {
+                rag.audit.log("REQUEST_FAILED", trace_id, {
                     "user_id": user_id,
-                    "error":   str(ve),
-                    "stage":   "context_scan",
+                    "error": str(ve),
+                    "stage": "context_scan",
                 })
-                error_payload = {"error": str(ve)}
-                yield f"data: {json.dumps(error_payload)}\n\n"
+                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
                 return
 
             async for chunk in rag_chain.astream(user_input):
                 full_answer += chunk
-                token_payload = {"token": chunk}
-                yield f"data: {json.dumps(token_payload)}\n\n"
+                yield f"data: {json.dumps({'token': chunk})}\n\n"
 
-            # ── Output guardrails + confidence + cache store ──
+            # Output guardrails + confidence + caching policy
             try:
-                full_answer = pre_filter_check(full_answer, trace_id)
-                full_answer = scan_answer_for_sensitive_terms(full_answer, trace_id)
-                full_answer = model_guard_check(full_answer, context, trace_id)
-                confidence  = compute_confidence(retrieved_docs, full_answer)
+                full_answer = rag.pre_filter_check(full_answer, trace_id)
+                full_answer = rag.scan_answer_for_sensitive_terms(full_answer, trace_id)
+                full_answer = rag.model_guard_check(full_answer, context, trace_id)
 
-                cached_flag = False
+                confidence = rag.compute_confidence(retrieved_docs, full_answer)
+
                 if confidence == "HIGH":
-                    llm_cache.set(user_role, user_input, {
-                        "answer":     full_answer,
+                    rag.llm_cache.set(user_role, user_input, {  # type: ignore[union-attr]
+                        "answer": full_answer,
                         "confidence": confidence,
                     })
-                    audit.log("CACHE_STORED", trace_id, {
-                        "user_id":    user_id,
-                        "role":       user_role,
+                    rag.audit.log("CACHE_STORED", trace_id, {
+                        "user_id": user_id,
+                        "role": user_role,
                         "confidence": confidence,
                     })
                 else:
-                    audit.log("CACHE_SKIPPED", trace_id, {
-                        "user_id":    user_id,
-                        "role":       user_role,
+                    rag.audit.log("CACHE_SKIPPED", trace_id, {
+                        "user_id": user_id,
+                        "role": user_role,
                         "confidence": confidence,
-                        "reason":     "low_confidence",
+                        "reason": "low_confidence",
                     })
 
-                audit.log("ANSWER", trace_id, {
-                    "user_id":    user_id,
-                    "email":      user_email,
-                    "role":       user_role,
-                    "message":    full_answer[:500],
+                rag.audit.log("ANSWER", trace_id, {
+                    "user_id": user_id,
+                    "email": user_email,
+                    "role": user_role,
+                    "message": full_answer[:500],
                     "confidence": confidence,
-                    "cached":     cached_flag,
-                    "sources":    retrieved_sources,
+                    "cached": False,
+                    "sources": retrieved_sources,
                 })
 
-                # ✅ FIX 2: dict built before json.dumps — no nested quotes
                 done_payload = {
-                    "done":       True,
-                    "answer":     full_answer,
+                    "done": True,
+                    "answer": full_answer,
                     "confidence": confidence,
-                    "cached":     False,
+                    "cached": False,
                 }
                 yield f"data: {json.dumps(done_payload)}\n\n"
 
             except ValueError as ve:
-                audit.log("REQUEST_FAILED", trace_id, {
+                rag.audit.log("REQUEST_FAILED", trace_id, {
                     "user_id": user_id,
-                    "error":   str(ve),
-                    "stage":   "output_guard",
+                    "error": str(ve),
+                    "stage": "output_guard",
                 })
-                error_payload = {"error": str(ve)}
-                yield f"data: {json.dumps(error_payload)}\n\n"
+                yield f"data: {json.dumps({'error': str(ve)})}\n\n"
 
         return StreamingResponse(stream_tokens(), media_type="text/event-stream")
 
     except ValueError as ve:
-        audit.log("REQUEST_FAILED", trace_id, {
+        rag.audit.log("REQUEST_FAILED", trace_id, {
             "user_id": user_id,
-            "error":   str(ve),
-            "stage":   "input_guard",
+            "error": str(ve),
+            "stage": "input_guard",
         })
         raise HTTPException(status_code=400, detail=str(ve))
 
     except Exception as e:
-        audit.log("REQUEST_FAILED", trace_id, {
+        rag.audit.log("REQUEST_FAILED", trace_id, {
             "user_id": user_id,
-            "error":   str(e),
-            "stage":   "unhandled",
+            "error": str(e),
+            "stage": "unhandled",
         })
         logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -468,48 +445,45 @@ async def secure_rag_eval(
     body: EvalRequest,
     x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
 ):
+    _require_rag_ready()
     _require_eval_key(x_eval_key)
 
-    batch_id = new_trace_id()
-    audit.log("EVAL_BATCH_START", batch_id, {"total_cases": len(body.cases)})
+    batch_id = rag.new_trace_id()
+    rag.audit.log("EVAL_BATCH_START", batch_id, {"total_cases": len(body.cases)})
 
     results = []
-    passed  = 0
+    passed = 0
 
     for i, case in enumerate(body.cases):
-        case_trace_id = new_trace_id()
-        case_id       = case.id or f"case_{i + 1}"
+        case_trace_id = rag.new_trace_id()
+        case_id = case.id or f"case_{i + 1}"
 
-        audit.log("EVAL_CASE_START", case_trace_id, {
-            "batch_id":         batch_id,
-            "case_id":          case_id,
-            "role":             case.role,
-            "should_block":     case.should_block,
+        rag.audit.log("EVAL_CASE_START", case_trace_id, {
+            "batch_id": batch_id,
+            "case_id": case_id,
+            "role": case.role,
+            "should_block": case.should_block,
             "question_preview": case.question[:120],
         })
 
-        answer            = None
-        confidence        = None
+        answer = None
+        confidence = None
         retrieved_sources = []
-        blocked           = False
-        error_msg         = None
+        blocked = False
+        error_msg = None
 
         try:
-            detect_prompt_injection(case.question, case_trace_id)
-            clean_input = redact_pii(case.question, case_trace_id)
+            rag.detect_prompt_injection(case.question, case_trace_id)
+            clean_input = rag.redact_pii(case.question, case_trace_id)
 
-            retriever      = build_secure_retriever(case.role, case_trace_id)
+            retriever = rag.build_secure_retriever(case.role, case_trace_id)
             retrieved_docs = retriever(clean_input)
-            retrieved_sources = [
-                d.metadata.get("file_name") for d in retrieved_docs
-            ]
+            retrieved_sources = [d.metadata.get("file_name") for d in retrieved_docs]
             context = "\n\n".join(d.page_content for d in retrieved_docs)
 
-            scan_context_for_credentials(context, case_trace_id)
+            rag.scan_context_for_credentials(context, case_trace_id)
 
-            sources_str = (
-                ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
-            )
+            sources_str = ", ".join(sorted(set(s for s in retrieved_sources if s))) or "none"
 
             setup = RunnableParallel(
                 context=lambda _: context,
@@ -517,31 +491,25 @@ async def secure_rag_eval(
                 role=lambda _: case.role,
                 sources=lambda _: sources_str,
             )
-            rag_chain = setup | secure_prompt | _llm | StrOutputParser()
-            answer    = await rag_chain.ainvoke(clean_input)
+            rag_chain = setup | rag.secure_prompt | rag._llm | StrOutputParser()
+            answer = await rag_chain.ainvoke(clean_input)
 
-            answer     = pre_filter_check(answer, case_trace_id)
-            answer     = scan_answer_for_sensitive_terms(answer, case_trace_id)
-            answer     = model_guard_check(answer, context, case_trace_id)
-            confidence = compute_confidence(retrieved_docs, answer)
+            answer = rag.pre_filter_check(answer, case_trace_id)
+            answer = rag.scan_answer_for_sensitive_terms(answer, case_trace_id)
+            answer = rag.model_guard_check(answer, context, case_trace_id)
+            confidence = rag.compute_confidence(retrieved_docs, answer)
 
         except Exception as e:
-            blocked    = True
-            error_msg  = str(e)
+            blocked = True
+            error_msg = str(e)
             confidence = "BLOCKED"
 
         checks = {}
         checks["block_check"] = (blocked == case.should_block)
-        checks["confidence_check"] = (
-            (confidence == case.expect_confidence)
-            if case.expect_confidence else True
-        )
+        checks["confidence_check"] = (confidence == case.expect_confidence) if case.expect_confidence else True
 
         if case.expect_answer_contains and answer:
-            checks["answer_content_check"] = all(
-                kw.lower() in answer.lower()
-                for kw in case.expect_answer_contains
-            )
+            checks["answer_content_check"] = all(kw.lower() in answer.lower() for kw in case.expect_answer_contains)
         elif case.expect_answer_contains and not answer:
             checks["answer_content_check"] = False
         else:
@@ -556,27 +524,27 @@ async def secure_rag_eval(
         if case_passed:
             passed += 1
 
-        audit.log("EVAL_CASE_RESULT", case_trace_id, {
-            "batch_id":   batch_id,
-            "case_id":    case_id,
-            "passed":     case_passed,
-            "blocked":    blocked,
+        rag.audit.log("EVAL_CASE_RESULT", case_trace_id, {
+            "batch_id": batch_id,
+            "case_id": case_id,
+            "passed": case_passed,
+            "blocked": blocked,
             "confidence": confidence,
-            "checks":     checks,
-            "sources":    retrieved_sources,
-            "error":      error_msg,
+            "checks": checks,
+            "sources": retrieved_sources,
+            "error": error_msg,
         })
 
         result = {
-            "case_id":    case_id,
-            "trace_id":   case_trace_id,
-            "role":       case.role,
-            "question":   case.question,
-            "passed":     case_passed,
-            "blocked":    blocked,
+            "case_id": case_id,
+            "trace_id": case_trace_id,
+            "role": case.role,
+            "question": case.question,
+            "passed": case_passed,
+            "blocked": blocked,
             "confidence": confidence,
-            "checks":     checks,
-            "error":      error_msg,
+            "checks": checks,
+            "error": error_msg,
         }
         if body.include_sources:
             result["sources"] = retrieved_sources
@@ -585,22 +553,22 @@ async def secure_rag_eval(
 
         results.append(result)
 
-    total     = len(body.cases)
+    total = len(body.cases)
     pass_rate = round((passed / total) * 100, 1) if total > 0 else 0.0
 
     summary = {
-        "batch_id":      batch_id,
-        "total":         total,
-        "passed":        passed,
-        "failed":        total - passed,
+        "batch_id": batch_id,
+        "total": total,
+        "passed": passed,
+        "failed": total - passed,
         "pass_rate_pct": pass_rate,
-        "results":       results,
+        "results": results,
     }
 
-    audit.log("EVAL_BATCH_DONE", batch_id, {
-        "total":         total,
-        "passed":        passed,
-        "failed":        total - passed,
+    rag.audit.log("EVAL_BATCH_DONE", batch_id, {
+        "total": total,
+        "passed": passed,
+        "failed": total - passed,
         "pass_rate_pct": pass_rate,
     })
     return summary
@@ -613,18 +581,20 @@ async def secure_rag_eval(
 async def cache_stats(
     x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
 ):
+    _require_rag_ready()
     _require_eval_key(x_eval_key)
-    stats = llm_cache.stats()
-    audit.log("CACHE_STATS_REQUESTED", "system", stats)
+    stats = rag.llm_cache.stats()  # type: ignore[union-attr]
+    rag.audit.log("CACHE_STATS_REQUESTED", "system", stats)
     return stats
 
 @app.delete("/secure-rag/cache/clear", tags=["Internal"])
 async def cache_clear(
     x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
 ):
+    _require_rag_ready()
     _require_eval_key(x_eval_key)
-    cleared = llm_cache.clear()
-    audit.log("CACHE_CLEARED", "system", {"entries_removed": cleared})
+    cleared = rag.llm_cache.clear()  # type: ignore[union-attr]
+    rag.audit.log("CACHE_CLEARED", "system", {"entries_removed": cleared})
     return {"status": "cleared", "entries_removed": cleared}
 
 # ============================================================
@@ -634,24 +604,25 @@ async def cache_clear(
 @app.get("/", tags=["Health"])
 def health():
     return {
-        "status":      "ok",
-        "service":     "Tech Secure RAG",
-        "version":     "3.0.0",
+        "status": "ok",
+        "service": "Tech Secure RAG",
+        "version": "3.0.0",
         "auth_loaded": AUTH_AVAILABLE,
-        "db_loaded":   DB_AVAILABLE,
-        "endpoint":    "/secure-rag/invoke",
+        "db_loaded": DB_AVAILABLE,
+        "rag_ready": (rag.llm_cache is not None and rag._vectorstore is not None and rag._llm is not None),
+        "endpoint": "/secure-rag/invoke",
     }
 
 @app.get("/health", tags=["Health"])
 async def health_check():
     health_status = {
-        "status":     "ok",
-        "service":    "Tech Secure RAG",
-        "version":    "3.0.0",
+        "status": "ok",
+        "service": "Tech Secure RAG",
+        "version": "3.0.0",
         "components": {},
     }
 
-    # ── PostgreSQL ────────────────────────────────────────────
+    # PostgreSQL
     if DB_AVAILABLE:
         try:
             from db.connection import engine
@@ -666,10 +637,10 @@ async def health_check():
         health_status["components"]["postgresql"] = "not_loaded"
         health_status["status"] = "degraded"
 
-    # ── FAISS ─────────────────────────────────────────────────
+    # FAISS
     try:
-        if _vectorstore is not None:
-            _ = _vectorstore.similarity_search("test", k=1)
+        if rag._vectorstore is not None:
+            _ = rag._vectorstore.similarity_search("test", k=1)
             health_status["components"]["faiss"] = "healthy"
         else:
             health_status["components"]["faiss"] = "not_loaded"
@@ -678,28 +649,40 @@ async def health_check():
         health_status["components"]["faiss"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
-    # ── Embeddings ────────────────────────────────────────────
+    # Embeddings
     try:
-        _embeddings.embed_query("health check")
-        health_status["components"]["embeddings"] = "healthy"
+        if rag._embeddings is not None:
+            rag._embeddings.embed_query("health check")
+            health_status["components"]["embeddings"] = "healthy"
+        else:
+            health_status["components"]["embeddings"] = "not_loaded"
+            health_status["status"] = "degraded"
     except Exception as e:
         health_status["components"]["embeddings"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
-    # ── LLM ───────────────────────────────────────────────────
+    # LLM
     try:
-        _llm.invoke("ping")
-        health_status["components"]["llm"] = "healthy"
+        if rag._llm is not None:
+            rag._llm.invoke("ping")
+            health_status["components"]["llm"] = "healthy"
+        else:
+            health_status["components"]["llm"] = "not_loaded"
+            health_status["status"] = "degraded"
     except Exception as e:
         health_status["components"]["llm"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
-    # ── Redis Cache ───────────────────────────────────────────
+    # Redis cache backend
     try:
-        stats = llm_cache.stats()
-        health_status["components"]["redis"] = (
-            "healthy" if stats.get("backend") == "redis" else "fallback"
-        )
+        if rag.llm_cache is not None:
+            stats = rag.llm_cache.stats()
+            health_status["components"]["redis"] = (
+                "healthy" if stats.get("backend") == "redis" else "fallback"
+            )
+        else:
+            health_status["components"]["redis"] = "not_loaded"
+            health_status["status"] = "degraded"
     except Exception as e:
         health_status["components"]["redis"] = f"error: {str(e)}"
         health_status["status"] = "degraded"

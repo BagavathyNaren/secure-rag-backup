@@ -45,4 +45,4 @@ EXPOSE 7860
 
 # Command to run the app
 # Make sure 'app.server:app' matches your file structure
-CMD ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "7860", "--proxy-headers", "--forwarded-allow-ips", "*"]

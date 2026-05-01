@@ -1,100 +1,66 @@
 # db/connection.py
-
-import os
 import logging
-import ssl
-
-from sqlalchemy.ext.asyncio import (
-    create_async_engine,
-    AsyncSession,
-    async_sessionmaker,
-)
-from sqlalchemy.pool import NullPool
-from models.database import Base
-
-from db.url_utils import validate_database_url, redact_database_url
+import re
+import os
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import event
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# CONNECTION STRING (validated + redacted logs)
-# ============================================================
+_SECRET_RE = re.compile(r"(?<=://)[^:]+:[^@]+(?=@)")
 
-_raw_url = os.environ.get("DATABASE_URL", "").strip()
-validate_database_url(_raw_url)
 
-# Never print secrets. This is safe.
-logger.info("DATABASE_URL_OK: %s", redact_database_url(_raw_url))
+def _mask_url(url: str) -> str:
+    return _SECRET_RE.sub("***", url)
 
-# Convert to asyncpg driver URL
-_async_url = (
-    _raw_url.replace("postgresql://", "postgresql+asyncpg://")
-            .replace("postgres://", "postgresql+asyncpg://")
-)
 
-# Keep a flag for SSL requirement based on original URL
-_ssl_required = "sslmode=require" in _raw_url.lower()
+def _get_async_database_url() -> str:
+    """
+    Return an asyncpg-compatible URL.
+    Never logs the raw value — callers receive the string directly.
+    """
+    raw = os.getenv("DATABASE_URL", "").strip()
+    if not raw:
+        raise RuntimeError("DATABASE_URL environment variable is not set.")
 
-# Strip query params (sslmode, etc.). We'll handle SSL via connect_args.
-if "?" in _async_url:
-    _async_url = _async_url.split("?", 1)[0]
+    # Neon / standard postgres → asyncpg driver
+    if raw.startswith("postgresql://"):
+        raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif raw.startswith("postgres://"):
+        raw = raw.replace("postgres://", "postgresql+asyncpg://", 1)
 
-# ============================================================
-# SSL CONTEXT (only if required)
-# ============================================================
+    return raw
 
-connect_args = {}
 
-if _ssl_required:
-    _ssl_context = ssl.create_default_context()
-    _ssl_context.check_hostname = True
-    _ssl_context.verify_mode = ssl.CERT_REQUIRED
-    connect_args = {"ssl": _ssl_context}
+_async_url = _get_async_database_url()
 
-# ============================================================
-# ENGINE
-# ============================================================
-
+# ── engine ────────────────────────────────────────────────────────────────────
+# echo=False is mandatory — SQLAlchemy logs the full connection string
+# (including credentials) when echo=True or when the root logger is DEBUG.
 engine = create_async_engine(
     _async_url,
-    echo=False,
+    echo=False,        # ← MUST stay False; credentials leak at echo=True
     pool_pre_ping=True,
-    poolclass=NullPool,
-    connect_args=connect_args,
+    pool_size=5,
+    max_overflow=10,
 )
 
-# ============================================================
-# SESSION FACTORY
-# ============================================================
+# ── safe connect-event log (fired per new physical connection) ────────────────
+@event.listens_for(engine.sync_engine, "connect")
+def _on_connect(dbapi_conn, connection_record):
+    # Only the masked URL is ever written to the log
+    logger.debug("New DB connection → %s", _mask_url(_async_url))
 
-AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
+
+AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
+    bind=engine,
     expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
 )
 
-# ============================================================
-# DEPENDENCY — FastAPI route injection
-# ============================================================
 
 async def get_db():
-    """Dependency injection for FastAPI routes."""
+    """FastAPI dependency — yields a scoped async DB session."""
     async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
-
-# ============================================================
-# TABLE CREATION — legacy (you now use Alembic in startup)
-# ============================================================
-
-async def init_db():
-    """Create all tables if they don't exist (legacy)."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables created/verified (create_all)")
+        yield session

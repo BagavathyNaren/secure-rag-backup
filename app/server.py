@@ -244,6 +244,7 @@ if AUTH_AVAILABLE:
         Returns JWT token valid for EXPIRE_MINS minutes.
         Use token as: Authorization: Bearer <token>
         """
+        _require_rag_ready()  # ✅ Step 4
         user = authenticate_user(form_data.username, form_data.password)
         if not user:
             rag.audit.log("LOGIN_FAILED", "auth", {

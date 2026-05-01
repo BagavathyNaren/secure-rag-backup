@@ -62,7 +62,7 @@ def log_event(event_type: str, data):
 # ============================================================
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
-REDIS_TTL_SECONDS = int(os.getenv("REDIS_TTL_SECONDS", "300"))
+REDIS_TTL_SECONDS = int(os.getenv("REDIS_TTL_SECONDS", "3600"))
 REDIS_PREFIX = os.getenv("REDIS_PREFIX", "secure_rag:cache:v1:")
 
 class InMemoryLLMCache:

@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import sys
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from alembic import context
 from logging.config import fileConfig
@@ -25,7 +24,8 @@ def _normalize_asyncpg_url(url: str) -> str:
     """
     Convert DATABASE_URL to asyncpg-compatible format:
     1. postgresql:// → postgresql+asyncpg://
-    2. Remove ?sslmode= (asyncpg uses connect_args={'ssl': ...} instead)
+    2. Strip ALL query parameters (sslmode, channel_binding, etc.)
+       asyncpg only accepts host, port, user, password, database, and connect_args
     """
     # Fix scheme
     if url.startswith("postgresql://"):
@@ -33,22 +33,11 @@ def _normalize_asyncpg_url(url: str) -> str:
     elif url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-    # Parse and strip sslmode from query params
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    query_params.pop("sslmode", None)  # Remove sslmode if present
+    # Strip everything after ? - asyncpg can't handle those params
+    if "?" in url:
+        url = url.split("?")[0]
 
-    # Rebuild URL without sslmode
-    new_query = urlencode(query_params, doseq=True)
-    normalized = urlunparse((
-        parsed.scheme,
-        parsed.netloc,
-        parsed.path,
-        parsed.params,
-        new_query,
-        parsed.fragment,
-    ))
-    return normalized
+    return url
 
 
 # ── Make sure /app is importable ──────────────────────────────────────────────
@@ -98,13 +87,13 @@ async def run_migrations_online() -> None:
     """Run migrations using async engine."""
     url = config.get_main_option("sqlalchemy.url")
 
-    # asyncpg expects ssl=True or ssl=False instead of sslmode
-    # Neon requires SSL, so we force it here
+    # asyncpg doesn't support sslmode, channel_binding, etc. as URL params.
+    # We pass SSL requirements via connect_args instead.
     connectable = create_async_engine(
         url,
         poolclass=NullPool,
         echo=False,
-        connect_args={"ssl": "require"},  # ← asyncpg SSL parameter
+        connect_args={"ssl": "require"},  # asyncpg uses ssl=, not sslmode=
     )
 
     def do_run_migrations(connection):

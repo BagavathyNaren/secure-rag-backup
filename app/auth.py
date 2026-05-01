@@ -84,50 +84,10 @@ async def authenticate_user_pg(identifier: str, password: str) -> Optional[dict]
 
     return _user_to_dict(user_obj)
 
-# ============================================================
-# MOCK USER DATABASE
-# Passwords are bcrypt hashed at module load time.
-#
-# In production → replace with real DB (PostgreSQL, etc.)
-#
-# To generate a hash manually in Python:
-#   import bcrypt
-#   print(bcrypt.hashpw(b"your_password", bcrypt.gensalt()).decode())
-# ============================================================
-
-def _make_user(user_id, username, email, role, password) -> dict:
-    return {
-        "user_id":         user_id,
-        "username":        username,
-        "email":           email,
-        "role":            role,
-        "hashed_password": hash_password(password),
-        "active":          True,
-    }
-
-USERS_DB: Dict[str, dict] = {
-    "alice": _make_user("usr_001", "alice", "alice@techcorp.com", "employee", "employee_pass"),
-    "bob":   _make_user("usr_002", "bob",   "bob@techcorp.com",   "finance",  "finance_pass"),
-    "carol": _make_user("usr_003", "carol", "carol@techcorp.com", "security", "security_pass"),
-    "dave":  _make_user("usr_004", "dave",  "dave@techcorp.com",  "admin",    "admin_pass"),
-}
-
-
-# ============================================================
-# USER AUTHENTICATION
-# ============================================================
-
-def authenticate_user(username: str, password: str) -> Optional[dict]:
-    user = USERS_DB.get(username)
-    if not user:
-        return None
-    if not user["active"]:
-        return None
-    if not verify_password(password, user["hashed_password"]):
-        return None
-    return user
-
-
+# Backward-compatible name: remove mock auth entirely, keep API stable
+async def authenticate_user(identifier: str, password: str) -> Optional[dict]:
+    return await authenticate_user_pg(identifier, password)
+    
 # ============================================================
 # JWT HELPERS
 # ============================================================

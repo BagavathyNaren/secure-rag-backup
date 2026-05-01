@@ -568,6 +568,37 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
         return "LOW"
 
     return "HIGH"
+    
+# ============================================================
+# Add shutdown helper
+# ============================================================
+
+def shutdown_rag() -> None:
+    """
+    Best-effort cleanup for external clients (Redis).
+    Safe to call multiple times.
+    """
+    global llm_cache
+
+    try:
+        # If Redis backend, close connections cleanly
+        if llm_cache is not None and hasattr(llm_cache, "_client"):
+            client = getattr(llm_cache, "_client", None)
+            if client is not None:
+                # redis-py 5 supports close(); keep try/except for compatibility
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+                # extra safe: disconnect pool
+                try:
+                    client.connection_pool.disconnect()
+                except Exception:
+                    pass
+    except Exception:
+        # Never raise during shutdown
+        pass
 
 
 # ============================================================

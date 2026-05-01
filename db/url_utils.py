@@ -1,47 +1,38 @@
-# db/url_utils.py
+# db/url_utils.py  (already imported in app/server.py — extend with mask guard)
+import re
 
-from urllib.parse import urlparse, urlunparse
+_SECRET_RE = re.compile(r"(?<=://)[^:]+:[^@]+(?=@)")
+
+_ALLOWED_SCHEMES = (
+    "postgresql://",
+    "postgresql+asyncpg://",
+    "postgres://",
+)
 
 
 def redact_database_url(url: str) -> str:
     """
-    postgresql://user:pass@host:5432/db?sslmode=require
-    -> postgresql://user:***@host:5432/db
+    Replace credentials in a DSN with ***.
+    This is the ONLY function that should appear in log statements.
+
+    Example
+    -------
+    postgresql://user:s3cr3t@host/db  →  postgresql://***@host/db
     """
-    if not url:
-        return ""
-
-    p = urlparse(url)
-    netloc = p.netloc
-
-    # redact password if present
-    if "@" in netloc:
-        creds, hostpart = netloc.split("@", 1)
-        if ":" in creds:
-            user = creds.split(":", 1)[0]
-            netloc = f"{user}:***@{hostpart}"
-        else:
-            netloc = f"{creds}@{hostpart}"
-
-    # strip query/fragment entirely
-    return urlunparse((p.scheme, netloc, p.path, "", "", ""))
+    return _SECRET_RE.sub("***", url)
 
 
 def validate_database_url(url: str) -> None:
-    if not url or not url.strip():
-        raise ValueError("DATABASE_URL is empty")
+    """
+    Raise ValueError if the URL is empty or uses an unsupported scheme.
+    Never logs or re-raises the raw URL in the exception message.
+    """
+    if not url:
+        raise ValueError("DATABASE_URL is empty or not set.")
 
-    p = urlparse(url)
-
-    if p.scheme not in ("postgresql", "postgres", "postgresql+asyncpg"):
-        raise ValueError(f"Unsupported DATABASE_URL scheme: {p.scheme}")
-
-    if not p.hostname:
-        raise ValueError("DATABASE_URL missing hostname")
-
-    if not p.path or p.path == "/":
-        raise ValueError("DATABASE_URL missing database name (path)")
-
-    # Usually required in prod; if you use IAM/peer auth you can relax this later
-    if p.username is None or not p.username.strip():
-        raise ValueError("DATABASE_URL missing username")
+    if not any(url.startswith(scheme) for scheme in _ALLOWED_SCHEMES):
+        raise ValueError(
+            f"DATABASE_URL uses an unsupported scheme. "
+            f"Expected one of: {', '.join(_ALLOWED_SCHEMES)}"
+            # ↑ scheme list only — raw URL is intentionally excluded
+        )

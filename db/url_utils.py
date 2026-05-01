@@ -1,4 +1,4 @@
-# db/url_utils.py  (already imported in app/server.py — extend with mask guard)
+# db/url_utils.py
 import re
 
 _SECRET_RE = re.compile(r"(?<=://)[^:]+:[^@]+(?=@)")
@@ -12,14 +12,25 @@ _ALLOWED_SCHEMES = (
 
 def redact_database_url(url: str) -> str:
     """
-    Replace credentials in a DSN with ***.
-    This is the ONLY function that should appear in log statements.
+    Mask credentials AND query params in a DSN for safe logging.
 
     Example
     -------
-    postgresql://user:s3cr3t@host/db  →  postgresql://***@host/db
+    postgresql://user:s3cr3t@host/db?sslmode=require
+    → postgresql://***@host/db
+
+    Rationale
+    ---------
+    Query params like ?sslmode=require&channel_binding=require can leak
+    internal infrastructure details; stripping them reduces the attack surface.
     """
-    return _SECRET_RE.sub("***", url)
+    masked = _SECRET_RE.sub("***", url)
+    
+    # Strip query params (everything after ?)
+    if "?" in masked:
+        masked = masked.split("?")[0]
+    
+    return masked
 
 
 def validate_database_url(url: str) -> None:
@@ -34,5 +45,4 @@ def validate_database_url(url: str) -> None:
         raise ValueError(
             f"DATABASE_URL uses an unsupported scheme. "
             f"Expected one of: {', '.join(_ALLOWED_SCHEMES)}"
-            # ↑ scheme list only — raw URL is intentionally excluded
         )

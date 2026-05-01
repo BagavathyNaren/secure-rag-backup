@@ -600,6 +600,36 @@ def shutdown_rag() -> None:
         # Never raise during shutdown
         pass
 
+LIFECYCLE_LAST_SHUTDOWN_KEY = "secure_rag:lifecycle:last_shutdown"
+
+def write_last_shutdown_marker(ts: str) -> None:
+    """
+    Store last shutdown timestamp in Redis (if using Redis cache).
+    No-op if cache backend isn't Redis.
+    """
+    global llm_cache
+    try:
+        if llm_cache is not None and hasattr(llm_cache, "_client"):
+            client = getattr(llm_cache, "_client", None)
+            if client is not None:
+                client.set(LIFECYCLE_LAST_SHUTDOWN_KEY, ts)
+    except Exception:
+        pass
+
+def read_last_shutdown_marker() -> str | None:
+    """
+    Read last shutdown timestamp from Redis (if using Redis cache).
+    """
+    global llm_cache
+    try:
+        if llm_cache is not None and hasattr(llm_cache, "_client"):
+            client = getattr(llm_cache, "_client", None)
+            if client is not None:
+                return client.get(LIFECYCLE_LAST_SHUTDOWN_KEY)
+    except Exception:
+        return None
+    return None
+
 
 # ============================================================
 # MAIN FUNCTION — WITH CACHING (optional helper; unchanged logic)

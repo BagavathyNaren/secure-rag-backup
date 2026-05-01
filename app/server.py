@@ -186,16 +186,18 @@ async def startup():
     rag.audit.log("STARTUP_COMPLETE", "startup", {"status": "ready"})
 
 def _require_rag_ready():
-    """
-    Defensive check: if startup hasn't completed, block requests with 503.
-    """
-    if rag.llm_cache is None or rag._vectorstore is None or rag._embeddings is None or rag._llm is None:
+    # Debug: force "not ready" to test 503 behavior
+    if os.getenv("FORCE_RAG_NOT_READY", "0").strip() == "1":
         raise HTTPException(
             status_code=503,
             detail="Service initializing. Please retry in a few seconds.",
         )
 
-
+    if rag.llm_cache is None or rag._vectorstore is None or rag._embeddings is None or rag._llm is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Service initializing. Please retry in a few seconds.",
+        )
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -244,6 +246,7 @@ if AUTH_AVAILABLE:
         Returns JWT token valid for EXPIRE_MINS minutes.
         Use token as: Authorization: Bearer <token>
         """
+        _require_rag_ready()  # ✅ Step 4
         user = authenticate_user(form_data.username, form_data.password)
         if not user:
             rag.audit.log("LOGIN_FAILED", "auth", {

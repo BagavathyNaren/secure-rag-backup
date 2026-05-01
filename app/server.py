@@ -635,6 +635,80 @@ async def cache_clear(
     rag.audit.log("CACHE_CLEARED", "system", {"entries_removed": cleared})
     return {"status": "cleared", "entries_removed": cleared}
 
+
+# ============================================================
+# 8b️⃣  LIFECYCLE / SHUTDOWN MARKER ENDPOINTS (Internal)
+# ============================================================
+
+@app.get("/internal/lifecycle/shutdown-marker", tags=["Internal"])
+async def lifecycle_read_shutdown_marker(
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
+):
+    _require_rag_ready()
+    _require_eval_key(x_eval_key)
+
+    val = rag.read_last_shutdown_marker()
+    backend = None
+    try:
+        backend = rag.llm_cache.stats().get("backend") if rag.llm_cache else None
+    except Exception:
+        backend = None
+
+    return {
+        "last_shutdown_ts": val,
+        "cache_backend": backend,
+    }
+
+
+@app.post("/internal/lifecycle/shutdown-marker", tags=["Internal"])
+async def lifecycle_write_shutdown_marker(
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
+):
+    _require_rag_ready()
+    _require_eval_key(x_eval_key)
+
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    rag.write_last_shutdown_marker(ts)
+
+    # Read-back check (proves it really landed in Redis)
+    read_back = rag.read_last_shutdown_marker()
+
+    return {
+        "written_ts": ts,
+        "read_back": read_back,
+    }
+
+
+# OPTIONAL (recommended): trigger graceful shutdown to test the shutdown hook.
+@app.post("/internal/lifecycle/terminate", tags=["Internal"])
+async def lifecycle_terminate(
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
+):
+    _require_rag_ready()
+    _require_eval_key(x_eval_key)
+
+    import os
+    import signal
+    import threading
+    import time
+
+    pid = os.getpid()
+
+    # Kill slightly after returning response so the client gets a response.
+    def _killer():
+        time.sleep(0.3)
+        os.kill(pid, signal.SIGTERM)
+
+    threading.Thread(target=_killer, daemon=True).start()
+
+    return {
+        "status": "terminating",
+        "pid": pid,
+        "note": "Server will receive SIGTERM; shutdown event should run if platform allows graceful stop.",
+    }
+
 # ============================================================
 # 9️⃣  HEALTH CHECKS
 # ============================================================

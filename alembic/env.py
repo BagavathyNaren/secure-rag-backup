@@ -1,94 +1,78 @@
-import asyncio
-import ssl
+# alembic/env.py
+import io
+import logging
 import os
-from logging.config import fileConfig
+import re
 
 from alembic import context
-from sqlalchemy import pool
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
 
-from models.database import Base  # must exist (your SQLAlchemy models)
+logger = logging.getLogger("alembic.env")
 
+_SECRET_RE = re.compile(r"(?<=://)[^:]+:[^@]+(?=@)")
+
+
+def _mask_url(url: str) -> str:
+    return _SECRET_RE.sub("***", url)
+
+
+# ── Alembic config object ─────────────────────────────────────────────────────
 config = context.config
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# Inject the real URL from the environment — Alembic never logs this value
+# because sqlalchemy.engine is kept at WARN in alembic.ini
+_raw_url = os.getenv("DATABASE_URL", "").strip()
+if not _raw_url:
+    raise RuntimeError("DATABASE_URL is not set — Alembic cannot continue.")
+
+config.set_main_option("sqlalchemy.url", _raw_url)
+
+# Only the masked form appears in any log record
+logger.info("Alembic targeting: %s", _mask_url(_raw_url))
+
+# ── metadata ──────────────────────────────────────────────────────────────────
+from db.base import Base          # noqa: E402
 target_metadata = Base.metadata
 
 
-def _normalize_db_url(raw: str) -> str:
-    if not raw:
-        raise RuntimeError("DATABASE_URL is not set")
-
-    url = raw.replace("postgresql://", "postgresql+asyncpg://").replace(
-        "postgres://", "postgresql+asyncpg://"
-    )
-
-    # strip URL params like ?sslmode=require (we handle SSL in driver config)
-    if "?" in url:
-        url = url.split("?", 1)[0]
-
-    return url
-
-
-def get_url() -> str:
-    return _normalize_db_url(os.getenv("DATABASE_URL", ""))
-
-
+# ── migration runners ─────────────────────────────────────────────────────────
 def run_migrations_offline() -> None:
-    url = get_url()
+    url = config.get_main_option("sqlalchemy.url")
+    logger.info("Offline mode → %s", _mask_url(url))   # masked
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        compare_type=True,
-    )
-
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-def do_run_migrations(connection) -> None:
-    context.configure(
-        connection=connection,
-        target_metadata=target_metadata,
-        compare_type=True,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 
-async def run_migrations_online() -> None:
-    raw = os.getenv("DATABASE_URL", "")
-    configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = get_url()
-
-    connect_args = {}
-    if "sslmode=require" in raw:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = True
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        connect_args = {"ssl": ctx}
-
-    connectable = async_engine_from_config(
-        configuration,
+def run_migrations_online() -> None:
+    cfg = config.get_section(config.config_ini_section, {})
+    connectable = engine_from_config(
+        cfg,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
-        connect_args=connect_args,
+        echo=False,          # ← credentials never echoed to logs
     )
+    logger.info("Online migration engine ready.")   # no URL here
 
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
-
-
-def run():
-    if context.is_offline_mode():
-        run_migrations_offline()
-    else:
-        asyncio.run(run_migrations_online())
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
 
 
-run()
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()

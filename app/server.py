@@ -161,7 +161,13 @@ async def startup():
             from db.url_utils import validate_database_url, redact_database_url
             raw = os.getenv("DATABASE_URL", "").strip()
             validate_database_url(raw)
-            rag.audit.log("DATABASE_URL_OK", "startup", {"database_url": redact_database_url(raw)})
+
+            # Strip query params before logging (they may contain internal details)
+            safe_url = redact_database_url(raw)
+            if "?" in safe_url:
+                 safe_url = safe_url.split("?")[0]
+
+            rag.audit.log("DATABASE_URL_OK", "startup", {"database_url": safe_url})
 
         except Exception as e:
             rag.audit.log("DB_MIGRATIONS_ERROR", "startup", {"error": str(e)})

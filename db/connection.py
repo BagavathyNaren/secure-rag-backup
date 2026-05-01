@@ -1,7 +1,9 @@
 # db/connection.py
 import logging
-import re
 import os
+import re
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import event
 
@@ -14,41 +16,54 @@ def _mask_url(url: str) -> str:
     return _SECRET_RE.sub("***", url)
 
 
+def _normalize_asyncpg_url(url: str) -> str:
+    """
+    Convert DATABASE_URL to asyncpg format:
+    1. postgresql:// → postgresql+asyncpg://
+    2. Strip ?sslmode= (asyncpg doesn't recognize it)
+    """
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    query_params.pop("sslmode", None)  # Remove sslmode
+
+    new_query = urlencode(query_params, doseq=True)
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment,
+    ))
+
+
 def _get_async_database_url() -> str:
-    """
-    Return an asyncpg-compatible URL.
-    Never logs the raw value — callers receive the string directly.
-    """
     raw = os.getenv("DATABASE_URL", "").strip()
     if not raw:
         raise RuntimeError("DATABASE_URL environment variable is not set.")
-
-    # Neon / standard postgres → asyncpg driver
-    if raw.startswith("postgresql://"):
-        raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif raw.startswith("postgres://"):
-        raw = raw.replace("postgres://", "postgresql+asyncpg://", 1)
-
-    return raw
+    return _normalize_asyncpg_url(raw)
 
 
 _async_url = _get_async_database_url()
 
 # ── engine ────────────────────────────────────────────────────────────────────
-# echo=False is mandatory — SQLAlchemy logs the full connection string
-# (including credentials) when echo=True or when the root logger is DEBUG.
 engine = create_async_engine(
     _async_url,
-    echo=False,        # ← MUST stay False; credentials leak at echo=True
+    echo=False,        # ← must stay False to prevent credential leaks
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,
+    connect_args={"ssl": "require"},  # ← asyncpg SSL param
 )
 
-# ── safe connect-event log (fired per new physical connection) ────────────────
+# ── safe connect-event log ────────────────────────────────────────────────────
 @event.listens_for(engine.sync_engine, "connect")
 def _on_connect(dbapi_conn, connection_record):
-    # Only the masked URL is ever written to the log
     logger.debug("New DB connection → %s", _mask_url(_async_url))
 
 

@@ -158,6 +158,11 @@ async def startup():
             import anyio
             await anyio.to_thread.run_sync(upgrade_head)
             rag.audit.log("DB_MIGRATIONS", "startup", {"status": "upgraded_to_head"})
+            from db.url_utils import validate_database_url, redact_database_url
+            raw = os.getenv("DATABASE_URL", "").strip()
+            validate_database_url(raw)
+            rag.audit.log("DATABASE_URL_OK", "startup", {"database_url": redact_database_url(raw)})
+
         except Exception as e:
             rag.audit.log("DB_MIGRATIONS_ERROR", "startup", {"error": str(e)})
             raise  # fail-fast recommended for production

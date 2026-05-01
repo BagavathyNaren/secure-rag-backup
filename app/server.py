@@ -20,12 +20,12 @@ from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 # ============================================================
-# DB IMPORTS
+# DB IMPORTS  (✅ Step 5.4: use Alembic upgrade instead of create_all)
 # ============================================================
 
 try:
-    from db.connection import init_db
     from db.seed import seed_users
+    from db.migrations import upgrade_head
     DB_AVAILABLE = True
 except Exception as e:
     import traceback as tb
@@ -152,13 +152,15 @@ def _require_eval_key(x_eval_key: Optional[str]):
 
 @app.on_event("startup")
 async def startup():
-    # 1) PostgreSQL init + seed
+    # 1) PostgreSQL migrations + seed
     if DB_AVAILABLE:
         try:
-            await init_db()
-            rag.audit.log("DB_INIT", "startup", {"status": "tables_ready"})
+            import anyio
+            await anyio.to_thread.run_sync(upgrade_head)
+            rag.audit.log("DB_MIGRATIONS", "startup", {"status": "upgraded_to_head"})
         except Exception as e:
-            rag.audit.log("DB_INIT_ERROR", "startup", {"error": str(e)})
+            rag.audit.log("DB_MIGRATIONS_ERROR", "startup", {"error": str(e)})
+            raise  # fail-fast recommended for production
 
         try:
             await seed_users()
@@ -171,10 +173,7 @@ async def startup():
     # 2) Cache init (Redis if available else memory)
     rag.init_cache()
     prev = rag.read_last_shutdown_marker()
-    if prev:
-        rag.audit.log("PREVIOUS_SHUTDOWN_MARKER", "startup", {"last_shutdown_ts": prev})
-    else:
-        rag.audit.log("PREVIOUS_SHUTDOWN_MARKER", "startup", {"last_shutdown_ts": None})
+    rag.audit.log("PREVIOUS_SHUTDOWN_MARKER", "startup", {"last_shutdown_ts": prev})
 
     # 3) Vectorstore init (FAISS load/build)
     force_rebuild = os.getenv("REBUILD_FAISS", "0").strip() == "1"
@@ -184,6 +183,7 @@ async def startup():
     rag.init_llm()
 
     rag.audit.log("STARTUP_COMPLETE", "startup", {"status": "ready"})
+
 
 def _require_rag_ready():
     # Debug: force "not ready" to test 503 behavior
@@ -218,14 +218,13 @@ async def shutdown():
     except Exception as e:
         rag.audit.log("RAG_SHUTDOWN_ERROR", "system", {"error": str(e)})
 
-    # Dispose DB engine
-    if DB_AVAILABLE:
-        try:
-            from db.connection import engine
-            await engine.dispose()
-            rag.audit.log("DB_ENGINE_DISPOSED", "system", {})
-        except Exception as e:
-            rag.audit.log("DB_ENGINE_DISPOSE_ERROR", "system", {"error": str(e)})
+    # Dispose DB engine (if present)
+    try:
+        from db.connection import engine
+        await engine.dispose()
+        rag.audit.log("DB_ENGINE_DISPOSED", "system", {})
+    except Exception as e:
+        rag.audit.log("DB_ENGINE_DISPOSE_ERROR", "system", {"error": str(e)})
 
     rag.audit.log("SHUTDOWN_COMPLETE", "system", {})
 
@@ -247,6 +246,7 @@ if AUTH_AVAILABLE:
         Use token as: Authorization: Bearer <token>
         """
         _require_rag_ready()  # ✅ Step 4
+
         user = authenticate_user(form_data.username, form_data.password)
         if not user:
             rag.audit.log("LOGIN_FAILED", "auth", {
@@ -638,7 +638,6 @@ async def cache_clear(
     rag.audit.log("CACHE_CLEARED", "system", {"entries_removed": cleared})
     return {"status": "cleared", "entries_removed": cleared}
 
-
 # ============================================================
 # 8b️⃣  LIFECYCLE / SHUTDOWN MARKER ENDPOINTS (Internal)
 # ============================================================
@@ -662,7 +661,6 @@ async def lifecycle_read_shutdown_marker(
         "cache_backend": backend,
     }
 
-
 @app.post("/internal/lifecycle/shutdown-marker", tags=["Internal"])
 async def lifecycle_write_shutdown_marker(
     x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
@@ -670,12 +668,8 @@ async def lifecycle_write_shutdown_marker(
     _require_rag_ready()
     _require_eval_key(x_eval_key)
 
-    from datetime import datetime, timezone
-
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     rag.write_last_shutdown_marker(ts)
-
-    # Read-back check (proves it really landed in Redis)
     read_back = rag.read_last_shutdown_marker()
 
     return {
@@ -683,8 +677,6 @@ async def lifecycle_write_shutdown_marker(
         "read_back": read_back,
     }
 
-
-# OPTIONAL (recommended): trigger graceful shutdown to test the shutdown hook.
 @app.post("/internal/lifecycle/terminate", tags=["Internal"])
 async def lifecycle_terminate(
     x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
@@ -692,14 +684,12 @@ async def lifecycle_terminate(
     _require_rag_ready()
     _require_eval_key(x_eval_key)
 
-    import os
     import signal
     import threading
     import time
 
     pid = os.getpid()
 
-    # Kill slightly after returning response so the client gets a response.
     def _killer():
         time.sleep(0.3)
         os.kill(pid, signal.SIGTERM)

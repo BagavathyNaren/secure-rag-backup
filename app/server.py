@@ -170,20 +170,21 @@ def _require_eval_key(x_eval_key: Optional[str]):
 
 @app.on_event("startup")
 async def startup():
-
     from datetime import datetime, timezone
 
-    def _log(event: str, **kwargs):
-        """Startup logs — always visible via print + flush."""
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "trace_id":  "startup",
-            "event":     event,
-            **kwargs,
-        }
-        print(json.dumps(entry), flush=True)
+    def _ts():
+        # Produce "Z" style timestamps like your other logs
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # ── Step 1: PostgreSQL — create tables ───────────────────
+    def _log(event: str, **kwargs):
+        print(json.dumps({
+            "timestamp": _ts(),
+            "trace_id": "startup",
+            "event": event,
+            **kwargs,
+        }), flush=True)
+
+    # 1) Create tables
     if DB_AVAILABLE:
         try:
             await init_db()
@@ -193,48 +194,13 @@ async def startup():
     else:
         _log("DB_INIT_SKIPPED", reason="db module failed to import")
 
-    # ── Step 2: PostgreSQL — seed mock users ─────────────────
+    # 2) Seed users
     if DB_AVAILABLE:
         try:
             await seed_users()
             _log("DB_SEED", status="complete")
         except Exception as e:
             _log("DB_SEED_ERROR", error=str(e))
-
-    # ── Step 3: Redis cache init ──────────────────────────────
-    try:
-        stats = llm_cache.stats()
-        _log(
-            "CACHE_INIT",
-            backend=stats.get("backend", "unknown"),
-            ttl_seconds=stats.get("ttl_seconds", "unknown"),
-            prefix=stats.get("prefix", "unknown"),
-        )
-    except Exception as e:
-        _log("CACHE_INIT_ERROR", error=str(e))
-
-    # ── Step 4: FAISS index check ─────────────────────────────
-    try:
-        faiss_path   = "faiss_index"
-        index_exists = os.path.exists(faiss_path)
-        _log(
-            "FAISS_INDEX_CHECK",
-            index_path=faiss_path,
-            exists=index_exists,
-            embedding_model="text-embedding-3-small",
-        )
-
-        if _vectorstore is not None:
-            ntotal = (
-                _vectorstore.index.ntotal
-                if hasattr(_vectorstore, "index")
-                else "unknown"
-            )
-            _log("FAISS_INDEX_LOADED", index_path=faiss_path, ntotal=ntotal)
-        else:
-            _log("FAISS_INDEX_NOT_LOADED", reason="_vectorstore is None")
-    except Exception as e:
-        _log("FAISS_INDEX_ERROR", error=str(e))
 # ============================================================
 # 5️⃣  AUTH ENDPOINTS
 # ============================================================

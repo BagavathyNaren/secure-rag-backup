@@ -44,6 +44,7 @@ try:
         get_current_user,
         require_role,
         EXPIRE_MINS,
+        authenticate_user_pg,   
     )
     AUTH_AVAILABLE = True
 except Exception as e:
@@ -259,6 +260,7 @@ if AUTH_AVAILABLE:
         _require_rag_ready()  # ✅ Step 4
 
         user = authenticate_user(form_data.username, form_data.password)
+        user = await authenticate_user_pg(form_data.username, form_data.password)
         if not user:
             rag.audit.log("LOGIN_FAILED", "auth", {
                 "username": form_data.username,

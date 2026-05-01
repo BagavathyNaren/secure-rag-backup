@@ -3,6 +3,7 @@
 import os
 import logging
 import ssl
+
 from sqlalchemy.ext.asyncio import (
     create_async_engine,
     AsyncSession,
@@ -11,40 +12,44 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 from models.database import Base
 
+from db.url_utils import validate_database_url, redact_database_url
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# CONNECTION STRING
+# CONNECTION STRING (validated + redacted logs)
 # ============================================================
 
-# Neon gives: postgresql://user:pass@host/db?sslmode=require
-# asyncpg needs: postgresql+asyncpg://user:pass@host/db
-# We strip ?sslmode=require and handle SSL via connect_args
+_raw_url = os.environ.get("DATABASE_URL", "").strip()
+validate_database_url(_raw_url)
 
-_raw_url = os.environ.get("DATABASE_URL", "")
+# Never print secrets. This is safe.
+logger.info("DATABASE_URL_OK: %s", redact_database_url(_raw_url))
 
-# Step 1 — replace scheme for asyncpg driver
-_async_url = _raw_url.replace(
-    "postgresql://",
-    "postgresql+asyncpg://"
-).replace(
-    "postgres://",          # some providers use postgres:// shorthand
-    "postgresql+asyncpg://"
+# Convert to asyncpg driver URL
+_async_url = (
+    _raw_url.replace("postgresql://", "postgresql+asyncpg://")
+            .replace("postgres://", "postgresql+asyncpg://")
 )
 
-# Step 2 — strip ?sslmode=require from URL
-#           (we pass SSL properly via connect_args instead)
+# Keep a flag for SSL requirement based on original URL
+_ssl_required = "sslmode=require" in _raw_url.lower()
+
+# Strip query params (sslmode, etc.). We'll handle SSL via connect_args.
 if "?" in _async_url:
-    _async_url = _async_url.split("?")[0]
+    _async_url = _async_url.split("?", 1)[0]
 
 # ============================================================
-# SSL CONTEXT
+# SSL CONTEXT (only if required)
 # ============================================================
 
-# asyncpg expects an ssl.SSLContext object, not a string
-_ssl_context = ssl.create_default_context()
-_ssl_context.check_hostname = True
-_ssl_context.verify_mode    = ssl.CERT_REQUIRED
+connect_args = {}
+
+if _ssl_required:
+    _ssl_context = ssl.create_default_context()
+    _ssl_context.check_hostname = True
+    _ssl_context.verify_mode = ssl.CERT_REQUIRED
+    connect_args = {"ssl": _ssl_context}
 
 # ============================================================
 # ENGINE
@@ -52,12 +57,10 @@ _ssl_context.verify_mode    = ssl.CERT_REQUIRED
 
 engine = create_async_engine(
     _async_url,
-    echo=False,          # Set True to debug SQL queries
+    echo=False,
     pool_pre_ping=True,
-    poolclass=NullPool,  # Required for serverless (Neon)
-    connect_args={
-        "ssl": _ssl_context   # ✅ correct way for asyncpg
-    },
+    poolclass=NullPool,
+    connect_args=connect_args,
 )
 
 # ============================================================
@@ -87,11 +90,11 @@ async def get_db():
             await session.close()
 
 # ============================================================
-# TABLE CREATION — called on startup
+# TABLE CREATION — legacy (you now use Alembic in startup)
 # ============================================================
 
 async def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist (legacy)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables created/verified")
+    logger.info("Database tables created/verified (create_all)")

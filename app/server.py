@@ -67,6 +67,58 @@ import app.secure_rag as rag
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_loaded_faiss_index(index_path: str = "faiss_index") -> dict:
+    """
+    Redacts credential-like patterns inside the already-built FAISS docstore
+    and re-saves the index. Logs only counts (never secrets).
+    """
+    import re
+
+    patterns = [
+        re.compile(r"claude-api-key-[a-zA-Z0-9\-]{10,}"),
+        re.compile(r"AKIA[0-9A-Z]{10,}"),  # AWS access key-ish (includes fake examples)
+    ]
+
+    obj = rag._vectorstore
+    if obj is None:
+        return {"status": "skipped", "reason": "vectorstore_none"}
+
+    # unwrap if it's a retriever wrapper
+    vs = getattr(obj, "vectorstore", obj)
+
+    docstore = getattr(vs, "docstore", None)
+    if docstore is None or not hasattr(docstore, "_dict"):
+        return {"status": "skipped", "reason": "docstore_not_supported"}
+
+    modified_docs = 0
+    total_replacements = 0
+
+    for _doc_id, doc in docstore._dict.items():  # type: ignore[attr-defined]
+        text = getattr(doc, "page_content", "") or ""
+        new_text = text
+        rep = 0
+        for pat in patterns:
+            new_text, c = pat.subn("<REDACTED>", new_text)
+            rep += c
+
+        if rep > 0:
+            doc.page_content = new_text
+            modified_docs += 1
+            total_replacements += rep
+
+    saved = False
+    if total_replacements > 0:
+        vs.save_local(index_path)
+        saved = True
+
+    return {
+        "status": "ok",
+        "modified_docs": modified_docs,
+        "total_replacements": total_replacements,
+        "saved": saved,
+    }
+
 # ============================================================
 # 1️⃣  FASTAPI INIT
 # ============================================================
@@ -190,6 +242,8 @@ async def startup():
     # 3) Vectorstore init (FAISS load/build)
     force_rebuild = os.getenv("REBUILD_FAISS", "0").strip() == "1"
     rag.init_vectorstore(force_rebuild=force_rebuild)
+    result = _sanitize_loaded_faiss_index("faiss_index")
+    rag.audit.log("FAISS_SANITIZE", "startup", result)
 
     # 4) LLM init
     rag.init_llm()

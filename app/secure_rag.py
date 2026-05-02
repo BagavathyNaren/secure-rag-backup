@@ -296,7 +296,11 @@ def init_vectorstore(force_rebuild: bool = False) -> FAISS:
     - If index exists and not force_rebuild -> load
     - Else -> build from documents, then save
     """
-    global _vectorstore
+    global _vectorstore, _embeddings
+
+    # ✅ Ensure embeddings are ready for BOTH FAISS and PGVector
+    if _embeddings is None:
+        init_embeddings()
     VECTORSTORE_BACKEND = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
     PGVECTOR_COLLECTION_NAME = os.getenv("PGVECTOR_COLLECTION_NAME", "secure_rag_collection")
 

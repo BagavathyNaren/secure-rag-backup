@@ -240,11 +240,19 @@ async def startup():
     prev = rag.read_last_shutdown_marker()
     rag.audit.log("PREVIOUS_SHUTDOWN_MARKER", "startup", {"last_shutdown_ts": prev})
 
-    # 3) Vectorstore init (FAISS load/build)
-    force_rebuild = os.getenv("REBUILD_FAISS", "0").strip() == "1"
+    # 3) Vectorstore init (FAISS or PGVector)
+    backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+
+    # Only meaningful for FAISS
+    force_rebuild = (backend == "faiss") and (os.getenv("REBUILD_FAISS", "0").strip() == "1")
+
     rag.init_vectorstore(force_rebuild=force_rebuild)
-    result = _sanitize_loaded_faiss_index("faiss_index")
-    rag.audit.log("FAISS_SANITIZE", "startup", result)
+
+    # Only sanitize FAISS indexes (PGVector has no FAISS docstore)
+    if backend == "faiss":
+          index_path = os.getenv("FAISS_INDEX_PATH", "faiss_index")
+          result = _sanitize_loaded_faiss_index(index_path)
+          rag.audit.log("FAISS_SANITIZE", "startup", result)
 
     # 4) LLM init
     rag.init_llm()

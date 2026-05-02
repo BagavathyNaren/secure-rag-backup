@@ -507,21 +507,25 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
         "employee": ["company_policy.txt", "engineering_standards.docx"],
         "security": ["security_policy.txt"],
         "finance": ["finance_policy.txt"],
+
+        # ✅ full access roles (no filtering)
         "admin": None,
+        "executive": None,
     }.get(user_role, [])
 
     retriever = _vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    if user_role == "admin":
-        def admin_retrieve(q):
+    # ✅ no-filter path for privileged roles
+    if allowed is None:
+        def privileged_retrieve(q):
             docs = retriever.invoke(q)
             audit.log("RETRIEVAL", trace_id, {
-                "role": "admin",
+                "role": user_role,
                 "doc_count": len(docs),
                 "sources": [d.metadata.get("file_name") for d in docs],
             })
             return docs
-        return admin_retrieve
+        return privileged_retrieve
 
     def role_retrieve(q):
         docs = retriever.invoke(q)

@@ -817,16 +817,17 @@ async def health_check():
         health_status["components"]["postgresql"] = "not_loaded"
         health_status["status"] = "degraded"
 
-    # FAISS
+    # Vectorstore (FAISS or PGVector)
     try:
+        backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
         if rag._vectorstore is not None:
-            _ = rag._vectorstore.similarity_search("test", k=1)
-            health_status["components"]["faiss"] = "healthy"
+               _ = rag._vectorstore.similarity_search("test", k=1)
+               health_status["components"]["vectorstore"] = f"healthy ({backend})"
         else:
-            health_status["components"]["faiss"] = "not_loaded"
-            health_status["status"] = "degraded"
+               health_status["components"]["vectorstore"] = "not_loaded"
+               health_status["status"] = "degraded"
     except Exception as e:
-        health_status["components"]["faiss"] = f"error: {str(e)}"
+        health_status["components"]["vectorstore"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
     # Embeddings

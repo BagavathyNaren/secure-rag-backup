@@ -11,7 +11,7 @@ langchain>=0.3.0
 langchain-openai>=0.3.0
 langchain-community>=0.3.0
 python-dotenv>=1.0.0
-langsmith>=0.2.0
+langsmith
 faiss-cpu>=1.7.4
 pypdf>=4.0.0
 pdf2image>=1.16.0
@@ -43,7 +43,7 @@ sqlalchemy==2.0.30
 passlib[bcrypt]==1.7.4
 alembic==1.13.1
 
-# --- The 3 New Additions ---
+# --- Postgres Additions ---
 pgvector==0.2.5
 psycopg[binary]==3.1.18
 langchain-postgres==0.0.12

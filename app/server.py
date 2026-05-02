@@ -15,6 +15,10 @@ import traceback
 import logging
 import os
 from datetime import datetime, timezone
+from fastapi import UploadFile, File
+from langchain_core.documents import Document
+import tempfile
+import shutil
 
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -588,6 +592,91 @@ async def internal_index(
         "trace_id": trace_id,
         "backend": os.getenv("VECTORSTORE_BACKEND", "faiss").lower(),
     }
+
+@app.post("/internal/upload", tags=["Internal"])
+@limiter.limit("2/minute")
+async def internal_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
+):
+    """
+    Upload a file (.txt, .pdf, .docx, .csv, .xlsx), parse it, chunk it, and index into PGVector.
+    """
+    _require_rag_ready()
+    _require_eval_key(x_eval_key)
+
+    trace_id = rag.new_trace_id()
+    filename = file.filename or "uploaded_file"
+
+    # Save uploaded file to a temp path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        # Parse based on extension
+        ext = filename.lower().split(".")[-1]
+        docs: List[Document] = []
+
+        if ext == "txt":
+            from langchain_community.document_loaders import TextLoader
+            loader = TextLoader(tmp_path)
+            docs = loader.load()
+
+        elif ext == "pdf":
+            from app.ingestion import load_pdf
+            docs = load_pdf(tmp_path)
+
+        elif ext == "docx":
+            from langchain_community.document_loaders import Docx2txtLoader
+            loader = Docx2txtLoader(tmp_path)
+            docs = loader.load()
+
+        elif ext == "csv":
+            from langchain_community.document_loaders import CSVLoader
+            loader = CSVLoader(tmp_path)
+            docs = loader.load()
+
+        elif ext == "xlsx":
+            import openpyxl
+            wb = openpyxl.load_workbook(tmp_path)
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                headers = [cell.value for cell in ws[1]]
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if all(v is None for v in row):
+                        continue
+                    row_data = dict(zip(headers, row))
+                    page_content = ", ".join(f"{k}: {v}" for k, v in row_data.items() if k)
+                    docs.append(Document(
+                        page_content=page_content,
+                        metadata={"file_name": filename, "sheet_name": sheet_name}
+                    ))
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
+
+        # Add file_name to metadata
+        for doc in docs:
+            doc.metadata["file_name"] = filename
+
+        # Chunk then index
+        from app.chunking import recursive_character_chunking
+        chunks = recursive_character_chunking(docs, chunk_size=600, chunk_overlap=150)
+
+        stored = rag.index_documents(chunks, trace_id=trace_id)
+
+        return {
+            "status": "ok",
+            "filename": filename,
+            "parsed_docs": len(docs),
+            "chunks": len(chunks),
+            "stored": stored,
+            "trace_id": trace_id,
+        }
+
+    finally:
+        os.unlink(tmp_path)
 
 # ============================================================
 # 7️⃣  EVALUATION ENDPOINT

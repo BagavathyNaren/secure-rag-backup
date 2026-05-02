@@ -8,6 +8,7 @@ import time
 import os
 from datetime import datetime
 from typing import Dict, Optional, Any
+from langchain_postgres.vectorstores import PGVector
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -280,6 +281,14 @@ def _faiss_ntotal(vs) -> int:
     except Exception:
         return -1
 
+def _pgvector_connection_string() -> str:
+    raw = os.getenv("DATABASE_URL", "").strip()
+    if raw.startswith("postgresql://"):
+        raw = raw.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif raw.startswith("postgres://"):
+        raw = raw.replace("postgres://", "postgresql+psycopg://", 1)
+    return raw
+
 
 def init_vectorstore(force_rebuild: bool = False) -> FAISS:
     """
@@ -288,6 +297,27 @@ def init_vectorstore(force_rebuild: bool = False) -> FAISS:
     - Else -> build from documents, then save
     """
     global _vectorstore
+    VECTORSTORE_BACKEND = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+    PGVECTOR_COLLECTION_NAME = os.getenv("PGVECTOR_COLLECTION_NAME", "secure_rag_collection")
+
+    
+    backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+
+    if backend == "pgvector":
+        conn = _pgvector_connection_string()
+
+        _vectorstore = PGVector(
+            embeddings=_embeddings,
+            connection=conn,
+            collection_name=PGVECTOR_COLLECTION_NAME,
+            use_jsonb=True,
+        )
+
+        audit.log("VECTORSTORE_INIT", "startup", {
+            "backend": "pgvector",
+            "collection_name": PGVECTOR_COLLECTION_NAME,
+        })
+        return
 
     init_embeddings()
 

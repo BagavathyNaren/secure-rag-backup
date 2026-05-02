@@ -201,6 +201,16 @@ def _require_eval_key(x_eval_key: Optional[str]):
         )
 
 # ============================================================
+# Pydantic Model to ingest into Neon pgvector at runtime.
+# ============================================================
+class IndexDoc(BaseModel):
+    text: str = Field(..., min_length=1)
+    metadata: dict = Field(default_factory=dict)
+
+class IndexRequest(BaseModel):
+    docs: List[IndexDoc]
+
+# ============================================================
 # 4️⃣  STARTUP EVENT (single unified startup log sequence)
 # ============================================================
 
@@ -549,6 +559,35 @@ async def secure_rag_endpoint(
         })
         logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.post("/internal/index", tags=["Internal"])
+@limiter.limit("2/minute")
+async def internal_index(
+    request: Request,
+    body: IndexRequest,
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
+):
+    _require_rag_ready()
+    _require_eval_key(x_eval_key)
+
+    trace_id = rag.new_trace_id()
+
+    # Build LangChain Documents
+    from langchain_core.documents import Document
+
+    docs = [
+        Document(page_content=d.text, metadata=(d.metadata or {}))
+        for d in body.docs
+    ]
+
+    stored = rag.index_documents(docs, trace_id=trace_id)
+
+    return {
+        "status": "ok",
+        "stored": stored,
+        "trace_id": trace_id,
+        "backend": os.getenv("VECTORSTORE_BACKEND", "faiss").lower(),
+    }
 
 # ============================================================
 # 7️⃣  EVALUATION ENDPOINT

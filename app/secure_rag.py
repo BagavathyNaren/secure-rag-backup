@@ -1,5 +1,4 @@
 # app/secure_rag.py
-
 import re
 import json
 import uuid
@@ -8,12 +7,15 @@ import time
 import os
 from datetime import datetime
 from typing import Dict, Optional, Any
+from langchain_postgres.vectorstores import PGVector
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
+from sqlalchemy import create_engine
 
 from app.config import *  # keep as-is if you rely on it elsewhere
 from app.ingestion import ingest_all
@@ -280,6 +282,14 @@ def _faiss_ntotal(vs) -> int:
     except Exception:
         return -1
 
+def _pgvector_connection_string() -> str:
+    raw = os.getenv("DATABASE_URL", "").strip()
+    if raw.startswith("postgresql://"):
+        raw = raw.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif raw.startswith("postgres://"):
+        raw = raw.replace("postgres://", "postgresql+psycopg://", 1)
+    return raw
+
 
 def init_vectorstore(force_rebuild: bool = False) -> FAISS:
     """
@@ -287,7 +297,36 @@ def init_vectorstore(force_rebuild: bool = False) -> FAISS:
     - If index exists and not force_rebuild -> load
     - Else -> build from documents, then save
     """
-    global _vectorstore
+    global _vectorstore, _embeddings
+
+    # ✅ Ensure embeddings are ready for BOTH FAISS and PGVector
+    if _embeddings is None:
+        init_embeddings()
+    VECTORSTORE_BACKEND = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+    PGVECTOR_COLLECTION_NAME = os.getenv("PGVECTOR_COLLECTION_NAME", "secure_rag_collection")
+
+    
+    backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+
+    if backend == "pgvector":
+        conn = _pgvector_connection_string()
+        engine = create_engine(conn,
+                    pool_pre_ping=True,   # ✅ detects dead SSL connections and reconnects
+                    pool_recycle=300,     # ✅ periodically refreshes connections
+                               )
+
+        _vectorstore = PGVector(
+                    embeddings=_embeddings,
+                    connection=engine,    # pass Engine instead of str
+                    collection_name=PGVECTOR_COLLECTION_NAME,
+                    use_jsonb=True,
+                                )
+
+        audit.log("VECTORSTORE_INIT", "startup", {
+            "backend": "pgvector",
+            "collection_name": PGVECTOR_COLLECTION_NAME,
+        })
+        return
 
     init_embeddings()
 
@@ -369,6 +408,63 @@ def ensure_initialized() -> None:
             + ", ".join(missing)
             + ". Ensure startup calls init_cache/init_vectorstore/init_llm."
         )
+
+# ============================================================
+# PRODUCTION INGESTION (PGVector): add_documents()
+# ============================================================
+
+_INDEX_REDACT_PATS = [
+    re.compile(r"claude-api-key-[a-zA-Z0-9\-]{10,}"),
+    re.compile(r"AKIA[0-9A-Z]{10,}"),
+    re.compile(r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}"),
+]
+
+def index_documents(docs: list[Document], trace_id: str = "system") -> int:
+    """
+    Persist new documents into the active vectorstore.
+
+    - With VECTORSTORE_BACKEND=pgvector: uses PGVector.add_documents() and data is durable in Neon.
+    - With VECTORSTORE_BACKEND=faiss: adds and saves locally (best-effort).
+    """
+    ensure_initialized()
+
+    backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+    if _vectorstore is None:
+        raise RuntimeError("Vectorstore not initialized")
+
+    # Redact credential-like strings before storing (defense in depth)
+    safe_docs: list[Document] = []
+    redactions = 0
+    for d in docs:
+        text = d.page_content or ""
+        for pat in _INDEX_REDACT_PATS:
+            text, c = pat.subn("<REDACTED>", text)
+            redactions += c
+
+        meta = dict(d.metadata or {})
+        # ensure metadata is JSON-serializable for Postgres JSONB
+        for k, v in list(meta.items()):
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                continue
+            meta[k] = str(v)
+
+        safe_docs.append(Document(page_content=text, metadata=meta))
+
+    ids = _vectorstore.add_documents(safe_docs)
+
+    # If FAISS, persist to disk
+    if backend == "faiss" and hasattr(_vectorstore, "save_local"):
+        os.makedirs(INDEX_PATH, exist_ok=True)
+        _vectorstore.save_local(INDEX_PATH)
+
+    audit.log("DOCS_INDEXED", trace_id, {
+        "backend": backend,
+        "docs_in": len(docs),
+        "stored": len(ids) if ids else len(docs),
+        "redactions": redactions,
+    })
+
+    return len(ids) if ids else len(docs)
 
 
 # ============================================================
@@ -473,21 +569,25 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
         "employee": ["company_policy.txt", "engineering_standards.docx"],
         "security": ["security_policy.txt"],
         "finance": ["finance_policy.txt"],
+
+        # ✅ full access roles (no filtering)
         "admin": None,
+        "executive": None,
     }.get(user_role, [])
 
     retriever = _vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    if user_role == "admin":
-        def admin_retrieve(q):
+    # ✅ no-filter path for privileged roles
+    if allowed is None:
+        def privileged_retrieve(q):
             docs = retriever.invoke(q)
             audit.log("RETRIEVAL", trace_id, {
-                "role": "admin",
+                "role": user_role,
                 "doc_count": len(docs),
                 "sources": [d.metadata.get("file_name") for d in docs],
             })
             return docs
-        return admin_retrieve
+        return privileged_retrieve
 
     def role_retrieve(q):
         docs = retriever.invoke(q)
@@ -548,7 +648,8 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
     if not retrieved_docs:
         return "LOW"
 
-    a = (answer or "").lower()
+    a = (answer or "").strip()
+    a_lower = a.lower()
 
     low_markers = [
         "not specified",
@@ -561,14 +662,18 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
         "do not know",
         "no information",
     ]
-    if any(m in a for m in low_markers):
+    if any(m in a_lower for m in low_markers):
         return "LOW"
 
-    if len(answer) < 30:
+    # ✅ NEW: short answers can be HIGH if they are directly present in retrieved context
+    if len(a) < 30:
+        if len(a) >= 6:
+            ctx = "\n".join(d.page_content for d in retrieved_docs).lower()
+            if a_lower in ctx:
+                return "HIGH"
         return "LOW"
 
     return "HIGH"
-    
 # ============================================================
 # Add shutdown helper
 # ============================================================

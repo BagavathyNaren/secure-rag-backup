@@ -77,7 +77,8 @@ def _sanitize_loaded_faiss_index(index_path: str = "faiss_index") -> dict:
 
     patterns = [
         re.compile(r"claude-api-key-[a-zA-Z0-9\-]{10,}"),
-        re.compile(r"AKIA[0-9A-Z]{10,}"),  # AWS access key-ish (includes fake examples)
+        re.compile(r"AKIA[0-9A-Z]{10,}"),  
+        re.compile(r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}")
     ]
 
     obj = rag._vectorstore
@@ -200,6 +201,16 @@ def _require_eval_key(x_eval_key: Optional[str]):
         )
 
 # ============================================================
+# Pydantic Model to ingest into Neon pgvector at runtime.
+# ============================================================
+class IndexDoc(BaseModel):
+    text: str = Field(..., min_length=1)
+    metadata: dict = Field(default_factory=dict)
+
+class IndexRequest(BaseModel):
+    docs: List[IndexDoc]
+
+# ============================================================
 # 4️⃣  STARTUP EVENT (single unified startup log sequence)
 # ============================================================
 
@@ -239,11 +250,19 @@ async def startup():
     prev = rag.read_last_shutdown_marker()
     rag.audit.log("PREVIOUS_SHUTDOWN_MARKER", "startup", {"last_shutdown_ts": prev})
 
-    # 3) Vectorstore init (FAISS load/build)
-    force_rebuild = os.getenv("REBUILD_FAISS", "0").strip() == "1"
+    # 3) Vectorstore init (FAISS or PGVector)
+    backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+
+    # Only meaningful for FAISS
+    force_rebuild = (backend == "faiss") and (os.getenv("REBUILD_FAISS", "0").strip() == "1")
+
     rag.init_vectorstore(force_rebuild=force_rebuild)
-    result = _sanitize_loaded_faiss_index("faiss_index")
-    rag.audit.log("FAISS_SANITIZE", "startup", result)
+
+    # Only sanitize FAISS indexes (PGVector has no FAISS docstore)
+    if backend == "faiss":
+          index_path = os.getenv("FAISS_INDEX_PATH", "faiss_index")
+          result = _sanitize_loaded_faiss_index(index_path)
+          rag.audit.log("FAISS_SANITIZE", "startup", result)
 
     # 4) LLM init
     rag.init_llm()
@@ -541,6 +560,35 @@ async def secure_rag_endpoint(
         logger.error(f"Unhandled error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+@app.post("/internal/index", tags=["Internal"])
+@limiter.limit("2/minute")
+async def internal_index(
+    request: Request,
+    body: IndexRequest,
+    x_eval_key: Optional[str] = Header(default=None, alias="x-eval-key"),
+):
+    _require_rag_ready()
+    _require_eval_key(x_eval_key)
+
+    trace_id = rag.new_trace_id()
+
+    # Build LangChain Documents
+    from langchain_core.documents import Document
+
+    docs = [
+        Document(page_content=d.text, metadata=(d.metadata or {}))
+        for d in body.docs
+    ]
+
+    stored = rag.index_documents(docs, trace_id=trace_id)
+
+    return {
+        "status": "ok",
+        "stored": stored,
+        "trace_id": trace_id,
+        "backend": os.getenv("VECTORSTORE_BACKEND", "faiss").lower(),
+    }
+
 # ============================================================
 # 7️⃣  EVALUATION ENDPOINT
 # ============================================================
@@ -808,16 +856,17 @@ async def health_check():
         health_status["components"]["postgresql"] = "not_loaded"
         health_status["status"] = "degraded"
 
-    # FAISS
+    # Vectorstore (FAISS or PGVector)
     try:
+        backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
         if rag._vectorstore is not None:
-            _ = rag._vectorstore.similarity_search("test", k=1)
-            health_status["components"]["faiss"] = "healthy"
+               _ = rag._vectorstore.similarity_search("test", k=1)
+               health_status["components"]["vectorstore"] = f"healthy ({backend})"
         else:
-            health_status["components"]["faiss"] = "not_loaded"
-            health_status["status"] = "degraded"
+               health_status["components"]["vectorstore"] = "not_loaded"
+               health_status["status"] = "degraded"
     except Exception as e:
-        health_status["components"]["faiss"] = f"error: {str(e)}"
+        health_status["components"]["vectorstore"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
 
     # Embeddings

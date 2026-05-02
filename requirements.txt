@@ -31,7 +31,7 @@ nltk
 langchain-huggingface
 sentence-transformers
 chromadb
-langchain-core>=0.3.0
+langchain-core==0.3.15
 huggingface_hub
 python-jose[cryptography]==3.3.0
 cryptography==42.0.8
@@ -43,7 +43,7 @@ sqlalchemy==2.0.30
 passlib[bcrypt]==1.7.4
 alembic==1.13.1
 
-# --- New Dependencies Added Below ---
+# --- The 3 New Additions ---
 pgvector==0.2.5
 psycopg[binary]==3.1.18
-langchain-postgres>=0.0.12
+langchain-postgres==0.0.12

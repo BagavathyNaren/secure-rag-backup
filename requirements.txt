@@ -1,5 +1,4 @@
 docx2txt>=0.8
-langserve>=0.3.0
 langserve[all]>=0.3.0
 fastapi>=0.110.0
 uvicorn>=0.29.0
@@ -43,6 +42,8 @@ asyncpg==0.29.0
 sqlalchemy==2.0.30
 passlib[bcrypt]==1.7.4
 alembic==1.13.1
+
+# --- New Dependencies Added Below ---
 pgvector==0.2.5
 psycopg[binary]==3.1.18
 langchain-postgres>=0.0.12

@@ -42,6 +42,6 @@ asyncpg==0.29.0
 sqlalchemy==2.0.30
 passlib[bcrypt]==1.7.4
 alembic==1.13.1
-pgvector
-psycopg[binary]
-langchain-postgres
+pgvector==0.2.5
+psycopg[binary]==3.1.18
+langchain-postgres==0.0.9

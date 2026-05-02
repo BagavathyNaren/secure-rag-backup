@@ -13,10 +13,13 @@ ENV PYTHONUNBUFFERED=1
 # Copy only requirements first (better caching)
 COPY requirements.txt .
 
+# Upgrade pip first to use the faster resolver
+RUN pip install --no-cache-dir --upgrade pip
+
 # Install dependencies to user local directory
 # --no-cache-dir: Don't store pip cache
 # --user: Install to ~/.local (easy to copy later)
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir --user -r requirements.txt --default-timeout=100
 
 
 # ============================================================

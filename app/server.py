@@ -77,7 +77,8 @@ def _sanitize_loaded_faiss_index(index_path: str = "faiss_index") -> dict:
 
     patterns = [
         re.compile(r"claude-api-key-[a-zA-Z0-9\-]{10,}"),
-        re.compile(r"AKIA[0-9A-Z]{10,}"),  # AWS access key-ish (includes fake examples)
+        re.compile(r"AKIA[0-9A-Z]{10,}"),  
+        re.compile(r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}")
     ]
 
     obj = rag._vectorstore

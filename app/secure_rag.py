@@ -15,6 +15,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
 
 from app.config import *  # keep as-is if you rely on it elsewhere
 from app.ingestion import ingest_all
@@ -403,6 +404,63 @@ def ensure_initialized() -> None:
             + ", ".join(missing)
             + ". Ensure startup calls init_cache/init_vectorstore/init_llm."
         )
+
+# ============================================================
+# PRODUCTION INGESTION (PGVector): add_documents()
+# ============================================================
+
+_INDEX_REDACT_PATS = [
+    re.compile(r"claude-api-key-[a-zA-Z0-9\-]{10,}"),
+    re.compile(r"AKIA[0-9A-Z]{10,}"),
+    re.compile(r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}"),
+]
+
+def index_documents(docs: list[Document], trace_id: str = "system") -> int:
+    """
+    Persist new documents into the active vectorstore.
+
+    - With VECTORSTORE_BACKEND=pgvector: uses PGVector.add_documents() and data is durable in Neon.
+    - With VECTORSTORE_BACKEND=faiss: adds and saves locally (best-effort).
+    """
+    ensure_initialized()
+
+    backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+    if _vectorstore is None:
+        raise RuntimeError("Vectorstore not initialized")
+
+    # Redact credential-like strings before storing (defense in depth)
+    safe_docs: list[Document] = []
+    redactions = 0
+    for d in docs:
+        text = d.page_content or ""
+        for pat in _INDEX_REDACT_PATS:
+            text, c = pat.subn("<REDACTED>", text)
+            redactions += c
+
+        meta = dict(d.metadata or {})
+        # ensure metadata is JSON-serializable for Postgres JSONB
+        for k, v in list(meta.items()):
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                continue
+            meta[k] = str(v)
+
+        safe_docs.append(Document(page_content=text, metadata=meta))
+
+    ids = _vectorstore.add_documents(safe_docs)
+
+    # If FAISS, persist to disk
+    if backend == "faiss" and hasattr(_vectorstore, "save_local"):
+        os.makedirs(INDEX_PATH, exist_ok=True)
+        _vectorstore.save_local(INDEX_PATH)
+
+    audit.log("DOCS_INDEXED", trace_id, {
+        "backend": backend,
+        "docs_in": len(docs),
+        "stored": len(ids) if ids else len(docs),
+        "redactions": redactions,
+    })
+
+    return len(ids) if ids else len(docs)
 
 
 # ============================================================

@@ -16,6 +16,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
+from sqlalchemy import create_engine
 
 from app.config import *  # keep as-is if you rely on it elsewhere
 from app.ingestion import ingest_all
@@ -310,13 +311,17 @@ def init_vectorstore(force_rebuild: bool = False) -> FAISS:
 
     if backend == "pgvector":
         conn = _pgvector_connection_string()
+        engine = create_engine(conn,
+                    pool_pre_ping=True,   # ✅ detects dead SSL connections and reconnects
+                    pool_recycle=300,     # ✅ periodically refreshes connections
+                               )
 
         _vectorstore = PGVector(
-            embeddings=_embeddings,
-            connection=conn,
-            collection_name=PGVECTOR_COLLECTION_NAME,
-            use_jsonb=True,
-        )
+                    embeddings=_embeddings,
+                    connection=engine,    # pass Engine instead of str
+                    collection_name=PGVECTOR_COLLECTION_NAME,
+                    use_jsonb=True,
+                                )
 
         audit.log("VECTORSTORE_INIT", "startup", {
             "backend": "pgvector",

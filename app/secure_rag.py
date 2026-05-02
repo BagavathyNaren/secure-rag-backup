@@ -420,29 +420,31 @@ _INDEX_REDACT_PATS = [
 ]
 
 def index_documents(docs: list[Document], trace_id: str = "system") -> int:
-    """
-    Persist new documents into the active vectorstore.
-
-    - With VECTORSTORE_BACKEND=pgvector: uses PGVector.add_documents() and data is durable in Neon.
-    - With VECTORSTORE_BACKEND=faiss: adds and saves locally (best-effort).
-    """
     ensure_initialized()
 
     backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
     if _vectorstore is None:
         raise RuntimeError("Vectorstore not initialized")
 
-    # Redact credential-like strings before storing (defense in depth)
+    # Redact + filter out empty docs
     safe_docs: list[Document] = []
     redactions = 0
+    skipped_empty = 0
+
     for d in docs:
-        text = d.page_content or ""
+        text = (d.page_content or "").strip()
+        
+        # Apply redaction patterns
         for pat in _INDEX_REDACT_PATS:
             text, c = pat.subn("<REDACTED>", text)
             redactions += c
 
+        # ✅ Skip if text becomes empty after redaction/stripping
+        if not text:
+            skipped_empty += 1
+            continue
+
         meta = dict(d.metadata or {})
-        # ensure metadata is JSON-serializable for Postgres JSONB
         for k, v in list(meta.items()):
             if isinstance(v, (str, int, float, bool)) or v is None:
                 continue
@@ -450,9 +452,20 @@ def index_documents(docs: list[Document], trace_id: str = "system") -> int:
 
         safe_docs.append(Document(page_content=text, metadata=meta))
 
+    if not safe_docs:
+        audit.log("DOCS_INDEXED", trace_id, {
+            "backend": backend,
+            "docs_in": len(docs),
+            "stored": 0,
+            "skipped_empty": skipped_empty,
+            "redactions": redactions,
+            "note": "all_docs_empty_after_filtering",
+        })
+        return 0
+
     ids = _vectorstore.add_documents(safe_docs)
 
-    # If FAISS, persist to disk
+    # FAISS: persist to disk
     if backend == "faiss" and hasattr(_vectorstore, "save_local"):
         os.makedirs(INDEX_PATH, exist_ok=True)
         _vectorstore.save_local(INDEX_PATH)
@@ -460,12 +473,12 @@ def index_documents(docs: list[Document], trace_id: str = "system") -> int:
     audit.log("DOCS_INDEXED", trace_id, {
         "backend": backend,
         "docs_in": len(docs),
-        "stored": len(ids) if ids else len(docs),
+        "stored": len(ids) if ids else len(safe_docs),
+        "skipped_empty": skipped_empty,
         "redactions": redactions,
     })
 
-    return len(ids) if ids else len(docs)
-
+    return len(ids) if ids else len(safe_docs)
 
 # ============================================================
 # GUARDRAILS (unchanged)

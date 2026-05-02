@@ -649,7 +649,8 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
     if not retrieved_docs:
         return "LOW"
 
-    a = (answer or "").lower()
+    a = (answer or "").strip()
+    a_lower = a.lower()
 
     low_markers = [
         "not specified",
@@ -662,14 +663,18 @@ def compute_confidence(retrieved_docs, answer: str) -> str:
         "do not know",
         "no information",
     ]
-    if any(m in a for m in low_markers):
+    if any(m in a_lower for m in low_markers):
         return "LOW"
 
-    if len(answer) < 30:
+    # ✅ NEW: short answers can be HIGH if they are directly present in retrieved context
+    if len(a) < 30:
+        if len(a) >= 6:
+            ctx = "\n".join(d.page_content for d in retrieved_docs).lower()
+            if a_lower in ctx:
+                return "HIGH"
         return "LOW"
 
     return "HIGH"
-    
 # ============================================================
 # Add shutdown helper
 # ============================================================

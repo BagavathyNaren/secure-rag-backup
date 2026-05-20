@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from db.connection import get_db
 from db.user_repository import UserRepository
+from app.auth import create_access_token
 import logging
 import json
 
@@ -17,6 +18,12 @@ async def login(
     credentials: dict,
     db: AsyncSession = Depends(get_db)
 ):
+    if "username" not in credentials or "password" not in credentials:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="username and password are required",
+        )
+
     repo = UserRepository(db)
     
     user = await repo.authenticate(
@@ -34,13 +41,12 @@ async def login(
             detail      = "Invalid credentials"
         )
     
-    # Generate JWT (your existing logic)
-    token = create_jwt_token(
-        user_id  = user.user_id,
-        username = user.username,
-        email    = user.email,
-        role     = user.role.value
-    )
+    token = create_access_token({
+        "user_id": user.user_id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role.value,
+    })
     
     logger.info(json.dumps({
         "trace_id": "auth",

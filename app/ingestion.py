@@ -11,6 +11,24 @@ import time
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_EXCLUDED_SOURCE_FILENAMES = {
+    "claude_api_tokens_2026_04.csv",
+    "Credits - My Billing Account.csv",
+    "Credits – My Billing Account.csv",
+}
+
+
+def excluded_source_filenames() -> set[str]:
+    raw = os.getenv(
+        "EXCLUDED_SOURCE_FILENAMES",
+        ",".join(sorted(DEFAULT_EXCLUDED_SOURCE_FILENAMES)),
+    )
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def should_skip_source(filename: str) -> bool:
+    return filename in excluded_source_filenames()
+
 # Windows: inject Poppler into PATH for this process (pdf2image dependency)
 # if os.name == "nt":
 #     os.environ["PATH"] = r"C:\Poppler\poppler-25.12.0\Library\bin" + os.pathsep + os.environ.get("PATH", "")
@@ -28,6 +46,9 @@ def load_text_files(directory: str) -> List[Document]:
 
     all_docs = []
     for filename in os.listdir(directory):
+        if should_skip_source(filename):
+            logger.warning("[INGEST_SKIP] excluded source: %s", filename)
+            continue
         if not filename.endswith(".txt") or filename == "urls.txt":
             continue
         file_path = os.path.join(directory, filename)
@@ -105,6 +126,9 @@ def load_docx_files(directory: str) -> List[Document]:
 
     all_docs = []
     for filename in os.listdir(directory):
+        if should_skip_source(filename):
+            logger.warning("[INGEST_SKIP] excluded source: %s", filename)
+            continue
         if not filename.endswith(".docx"):
             continue
         file_path = os.path.join(directory, filename)
@@ -138,6 +162,9 @@ def load_excel_files(directory: str) -> List[Document]:
 
     all_docs = []
     for filename in os.listdir(directory):
+        if should_skip_source(filename):
+            logger.warning("[INGEST_SKIP] excluded source: %s", filename)
+            continue
         if not filename.endswith(".xlsx"):
             continue
         file_path = os.path.join(directory, filename)
@@ -191,6 +218,9 @@ def ingest_all() -> List[Document]:
 
     pdf_docs = []
     for filename in os.listdir("data/"):
+        if should_skip_source(filename):
+            logger.warning("[INGEST_SKIP] excluded source: %s", filename)
+            continue
         if not filename.endswith(".pdf"):
             continue
         file_path = os.path.join("data/", filename)
@@ -198,6 +228,9 @@ def ingest_all() -> List[Document]:
 
     csv_docs = []
     for filename in os.listdir("data/"):
+        if should_skip_source(filename):
+            logger.warning("[INGEST_SKIP] excluded source: %s", filename)
+            continue
         if not filename.endswith(".csv"):
             continue
         file_path = os.path.join("data/", filename)

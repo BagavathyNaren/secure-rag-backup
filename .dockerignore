@@ -1,0 +1,48 @@
+# Git and local environments
+.git
+.gitignore
+.gitattributes
+.conda/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# Raw source data should not be copied into the runtime image.
+# The app loads the prebuilt FAISS index or PGVector instead.
+data/
+notes.md
+Project-structure.pdf
+RAG_BEST_PRACTICES.md
+
+# Local/editor noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+logs/
+tmp/
+temp/
+
+# Test/cache artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.ipynb
+.ipynb_checkpoints/
+node_modules/
+

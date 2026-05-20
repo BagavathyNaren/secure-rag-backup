@@ -68,6 +68,31 @@ EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-3-small
 
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
 
+DEFAULT_EXCLUDED_SOURCE_FILENAMES = {
+    "claude_api_tokens_2026_04.csv",
+    "Credits - My Billing Account.csv",
+    "Credits – My Billing Account.csv",
+}
+
+EXCLUDED_SOURCE_FILENAMES = {
+    name.strip()
+    for name in os.getenv(
+        "EXCLUDED_SOURCE_FILENAMES",
+        ",".join(sorted(DEFAULT_EXCLUDED_SOURCE_FILENAMES)),
+    ).split(",")
+    if name.strip()
+}
+
+ROLE_SOURCE_ALLOWLIST = {
+    "employee": ["company_policy.txt", "engineering_standards.docx"],
+    "manager": ["company_policy.txt", "engineering_standards.docx", "security_policy.txt"],
+    "hr": ["company_policy.txt", "employee_handbook.pdf"],
+    "security": ["security_policy.txt", "engineering_standards.docx"],
+    "finance": ["finance_policy.txt"],
+    "admin": None,
+    "executive": None,
+}
+
 
 # ============================================================
 # GLOBALS (initialized during FastAPI startup)
@@ -486,6 +511,7 @@ def index_documents(docs: list[Document], trace_id: str = "system") -> int:
 
 DANGEROUS_PATTERNS = [
     r"AKIA[0-9A-Z]{16}",
+    r"sk-[a-zA-Z0-9]{32,}",
     r"sk_[a-zA-Z0-9]{32,}",
     r"claude-api-key",
     r"-----BEGIN",
@@ -508,6 +534,7 @@ SENSITIVE_CONTEXT_PATTERNS = [
     r"ghp_[a-zA-Z0-9]{36}",
     r"(?i)secret.{0,5}access.{0,5}key\s*[:=]\s*\S{10,}",
     r"(?i)access.{0,5}key.{0,5}id\s*[:=]\s*[A-Z0-9]{10,}",
+    r"sk-[a-zA-Z0-9]{32,}",
     r"sk_[a-zA-Z0-9]{32,}",
 ]
 
@@ -578,25 +605,21 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
     if _vectorstore is None:
         raise RuntimeError("Vectorstore not initialized. Call init_vectorstore() during startup.")
 
-    allowed = {
-        "employee": ["company_policy.txt", "engineering_standards.docx"],
-        "security": ["security_policy.txt"],
-        "finance": ["finance_policy.txt"],
-
-        # ✅ full access roles (no filtering)
-        "admin": None,
-        "executive": None,
-    }.get(user_role, [])
+    allowed = ROLE_SOURCE_ALLOWLIST.get(user_role, [])
+    excluded = EXCLUDED_SOURCE_FILENAMES
 
     retriever = _vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # ✅ no-filter path for privileged roles
+    def is_not_excluded(doc: Document) -> bool:
+        return doc.metadata.get("file_name") not in excluded
+
     if allowed is None:
         def privileged_retrieve(q):
-            docs = retriever.invoke(q)
+            docs = [doc for doc in retriever.invoke(q) if is_not_excluded(doc)]
             audit.log("RETRIEVAL", trace_id, {
                 "role": user_role,
                 "doc_count": len(docs),
+                "excluded_sources": sorted(excluded),
                 "sources": [d.metadata.get("file_name") for d in docs],
             })
             return docs
@@ -604,10 +627,15 @@ def build_secure_retriever(user_role: str, trace_id: str = "system"):
 
     def role_retrieve(q):
         docs = retriever.invoke(q)
-        filtered = [d for d in docs if d.metadata.get("file_name") in allowed]
+        filtered = [
+            d
+            for d in docs
+            if d.metadata.get("file_name") in allowed and is_not_excluded(d)
+        ]
         audit.log("RETRIEVAL", trace_id, {
             "role": user_role,
             "allowed_sources": allowed,
+            "excluded_sources": sorted(excluded),
             "retrieved": len(docs),
             "returned": len(filtered),
             "sources": [d.metadata.get("file_name") for d in filtered],
@@ -760,7 +788,7 @@ def secure_rag_invoke(user_input: str, user_role: str = "employee") -> Dict:
 
     audit.log("REQUEST_START", trace_id, {
         "role": user_role,
-        "question_preview": user_input[:80],
+        "question_preview": redact_pii(user_input[:80], trace_id),
     })
 
     try:

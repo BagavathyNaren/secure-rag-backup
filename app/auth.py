@@ -21,7 +21,7 @@ from fastapi.security import OAuth2PasswordBearer
 # JWT_ALGORITHM   → HS256 (default)
 # JWT_EXPIRE_MINS → 60 (default)
 
-SECRET_KEY  = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_USE_LONG_RANDOM_STRING")
+SECRET_KEY  = os.getenv("JWT_SECRET_KEY", "").strip()
 ALGORITHM   = os.getenv("JWT_ALGORITHM", "HS256")
 EXPIRE_MINS = int(os.getenv("JWT_EXPIRE_MINS", "60"))
 
@@ -129,10 +129,10 @@ def decode_token(token: str) -> dict:
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return payload
-    except JWTError as e:
+    except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid or expired token: {str(e)}",
+            detail="Invalid or expired token.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 

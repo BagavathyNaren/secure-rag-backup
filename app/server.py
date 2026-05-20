@@ -1,6 +1,7 @@
 # app/server.py
 
 from fastapi import FastAPI, HTTPException, Request, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from slowapi import Limiter
@@ -22,6 +23,7 @@ import shutil
 
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from app.runtime_config import get_csv_env, validate_required_env
 
 # ============================================================
 # DB IMPORTS  (✅ Step 5.4: use Alembic upgrade instead of create_all)
@@ -134,6 +136,21 @@ app = FastAPI(
     version="3.0.0",
 )
 
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_csv_env("CORS_ALLOW_ORIGINS", ",".join(DEFAULT_CORS_ORIGINS)),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "x-eval-key"],
+)
+
 # ============================================================
 # 2️⃣  RATE LIMITING
 # ============================================================
@@ -220,6 +237,18 @@ class IndexRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    try:
+        validate_required_env()
+        rag.audit.log("RUNTIME_CONFIG_OK", "startup", {"status": "validated"})
+    except Exception as e:
+        rag.audit.log("RUNTIME_CONFIG_ERROR", "startup", {"error": str(e)})
+        raise
+
+    if not DB_AVAILABLE:
+        raise RuntimeError("Database modules failed to load; refusing to start.")
+    if not AUTH_AVAILABLE:
+        raise RuntimeError("Authentication module failed to load; refusing to start.")
+
     # 1) PostgreSQL migrations + seed
     if DB_AVAILABLE:
         try:
@@ -415,7 +444,7 @@ async def secure_rag_endpoint(
         "user_id": user_id,
         "email": user_email,
         "role": user_role,
-        "question_preview": body.question[:120],
+        "question_preview": rag.redact_pii(body.question[:120], trace_id),
     })
 
     try:
@@ -707,7 +736,7 @@ async def secure_rag_eval(
             "case_id": case_id,
             "role": case.role,
             "should_block": case.should_block,
-            "question_preview": case.question[:120],
+            "question_preview": rag.redact_pii(case.question[:120], case_trace_id),
         })
 
         answer = None
@@ -917,89 +946,82 @@ def health():
         "version": "3.0.0",
         "auth_loaded": AUTH_AVAILABLE,
         "db_loaded": DB_AVAILABLE,
-        "rag_ready": (rag.llm_cache is not None and rag._vectorstore is not None and rag._llm is not None),
+        "rag_ready": (
+            rag.llm_cache is not None
+            and rag._vectorstore is not None
+            and rag._embeddings is not None
+            and rag._llm is not None
+        ),
         "endpoint": "/secure-rag/invoke",
     }
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    health_status = {
+    return {
         "status": "ok",
+        "service": "Tech Secure RAG",
+        "version": "3.0.0",
+        "auth_loaded": AUTH_AVAILABLE,
+        "db_loaded": DB_AVAILABLE,
+        "rag_ready": (
+            rag.llm_cache is not None
+            and rag._vectorstore is not None
+            and rag._embeddings is not None
+            and rag._llm is not None
+        ),
+    }
+
+@app.get("/ready", tags=["Health"])
+async def readiness_check():
+    ready_status = {
+        "status": "ready",
         "service": "Tech Secure RAG",
         "version": "3.0.0",
         "components": {},
     }
 
-    # PostgreSQL
     if DB_AVAILABLE:
         try:
             from db.connection import engine
             import sqlalchemy
             async with engine.connect() as conn:
                 await conn.execute(sqlalchemy.text("SELECT 1"))
-            health_status["components"]["postgresql"] = "healthy"
+            ready_status["components"]["postgresql"] = "healthy"
         except Exception as e:
-            health_status["components"]["postgresql"] = f"error: {str(e)}"
-            health_status["status"] = "degraded"
+            ready_status["components"]["postgresql"] = f"error: {str(e)}"
+            ready_status["status"] = "degraded"
     else:
-        health_status["components"]["postgresql"] = "not_loaded"
-        health_status["status"] = "degraded"
+        ready_status["components"]["postgresql"] = "not_loaded"
+        ready_status["status"] = "degraded"
 
-    # Vectorstore (FAISS or PGVector)
-    try:
-        backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
-        if rag._vectorstore is not None:
-               _ = rag._vectorstore.similarity_search("test", k=1)
-               health_status["components"]["vectorstore"] = f"healthy ({backend})"
-        else:
-               health_status["components"]["vectorstore"] = "not_loaded"
-               health_status["status"] = "degraded"
-    except Exception as e:
-        health_status["components"]["vectorstore"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
+    backend = os.getenv("VECTORSTORE_BACKEND", "faiss").lower()
+    ready_status["components"]["vectorstore"] = (
+        f"initialized ({backend})" if rag._vectorstore is not None else "not_loaded"
+    )
+    ready_status["components"]["embeddings"] = (
+        "initialized" if rag._embeddings is not None else "not_loaded"
+    )
+    ready_status["components"]["llm"] = (
+        "initialized" if rag._llm is not None else "not_loaded"
+    )
 
-    # Embeddings
-    try:
-        if rag._embeddings is not None:
-            rag._embeddings.embed_query("health check")
-            health_status["components"]["embeddings"] = "healthy"
-        else:
-            health_status["components"]["embeddings"] = "not_loaded"
-            health_status["status"] = "degraded"
-    except Exception as e:
-        health_status["components"]["embeddings"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
+    if rag._vectorstore is None or rag._embeddings is None or rag._llm is None:
+        ready_status["status"] = "degraded"
 
-    # LLM
-    try:
-        if rag._llm is not None:
-            rag._llm.invoke("ping")
-            health_status["components"]["llm"] = "healthy"
-        else:
-            health_status["components"]["llm"] = "not_loaded"
-            health_status["status"] = "degraded"
-    except Exception as e:
-        health_status["components"]["llm"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
-
-    # Redis cache backend
     try:
         if rag.llm_cache is not None:
             stats = rag.llm_cache.stats()
-            health_status["components"]["redis"] = (
+            ready_status["components"]["cache"] = (
                 "healthy" if stats.get("backend") == "redis" else "fallback"
             )
         else:
-            health_status["components"]["redis"] = "not_loaded"
-            health_status["status"] = "degraded"
+            ready_status["components"]["cache"] = "not_loaded"
+            ready_status["status"] = "degraded"
     except Exception as e:
-        health_status["components"]["redis"] = f"error: {str(e)}"
-        health_status["status"] = "degraded"
+        ready_status["components"]["cache"] = f"error: {str(e)}"
+        ready_status["status"] = "degraded"
 
-    if all(v == "healthy" for v in health_status["components"].values()):
-        health_status["status"] = "healthy"
-
-    return health_status
+    return ready_status
 
 # ============================================================
 # 🔟  ENTRYPOINT
